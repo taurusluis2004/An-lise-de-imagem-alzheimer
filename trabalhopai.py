@@ -1,4 +1,4 @@
-# oasis-alzheimer-s-detection-binary.py
+# trabalhopai.py
 
 # --- Import libraries ---
 import numpy as np 
@@ -6,223 +6,287 @@ import os
 import pandas as pd 
 import seaborn as sns
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from keras.models import Sequential
-from keras.layers import Conv2D, Flatten, Dense, Dropout, BatchNormalization, MaxPooling2D
+from sklearn.model_selection import train_test_split
+from keras.models import Model
+from keras.layers import Input, Conv2D, Flatten, Dense, Dropout, BatchNormalization, MaxPooling2D
+from keras.applications import DenseNet121
 import nibabel as nib
 from skimage.transform import resize
-from sklearn.preprocessing import LabelEncoder
+from skimage.feature import graycomatrix, graycoprops
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.svm import SVC
+import xgboost as xgb
+from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, roc_auc_score, mean_absolute_error
 
-# --- Import and Preprocess Dataset ---
-
-# Read the demographic data
-demographics_df = pd.read_csv('oasis_longitudinal_demographic.csv', sep=';')
-
-# Clean 'CDR' and 'SES' columns
-demographics_df['CDR'] = demographics_df['CDR'].astype(str).str.replace(',', '.', regex=False)
-demographics_df['CDR'] = pd.to_numeric(demographics_df['CDR'], errors='coerce')
-demographics_df['SES'] = pd.to_numeric(demographics_df['SES'], errors='coerce')
-
-# Define binary diagnosis function
-def get_diagnosis_binary(row):
-    if row['Group'] == 'Nondemented':
-        return 'NonDemented'
-    elif row['Group'] == 'Demented':
-        return 'Demented'
-    elif row['Group'] == 'Converted':
-        if row['CDR'] == 0:
-            return 'NonDemented'
-        elif row['CDR'] > 0:
-            return 'Demented'
-    return 'Unknown'
-
-demographics_df['Diagnosis'] = demographics_df.apply(get_diagnosis_binary, axis=1)
-
-# Filter out 'Unknown' diagnoses and missing data
-demographics_df = demographics_df[demographics_df['Diagnosis'] != 'Unknown'].dropna(subset=['MRI ID', 'Subject ID'])
-
-
-# --- Patient-Based Train/Test Split ---
-
-# Get unique patients and their final diagnosis (most severe)
-patient_diagnoses = demographics_df.groupby('Subject ID')['CDR'].max().reset_index()
-
-def get_final_diagnosis(cdr):
-    return 'Demented' if cdr > 0 else 'NonDemented'
-
-patient_diagnoses['Diagnosis'] = patient_diagnoses['CDR'].apply(get_final_diagnosis)
-
-# Encode diagnoses for stratification
-le = LabelEncoder()
-patient_diagnoses['Diagnosis_encoded'] = le.fit_transform(patient_diagnoses['Diagnosis'])
-
-# Split patients into training (80%) and testing (20%)
-train_patients, test_patients = train_test_split(
-    patient_diagnoses, 
-    test_size=0.2, 
-    random_state=42, 
-    stratify=patient_diagnoses['Diagnosis_encoded']
-)
-
-# Further split training patients into training (80%) and validation (20%)
-train_patients, val_patients = train_test_split(
-    train_patients,
-    test_size=0.2,
-    random_state=42,
-    stratify=train_patients['Diagnosis_encoded']
-)
-
-# Get the MRI IDs for each set
-train_mri_ids = demographics_df[demographics_df['Subject ID'].isin(train_patients['Subject ID'])]['MRI ID'].tolist()
-val_mri_ids = demographics_df[demographics_df['Subject ID'].isin(val_patients['Subject ID'])]['MRI ID'].tolist()
-test_mri_ids = demographics_df[demographics_df['Subject ID'].isin(test_patients['Subject ID'])]['MRI ID'].tolist()
-
-
-# Create mappings from MRI ID to Diagnosis (0 for NonDemented, 1 for Demented)
-demographics_df['Diagnosis_encoded'] = le.transform(demographics_df['Diagnosis'])
-mri_diagnosis_map = dict(zip(demographics_df['MRI ID'], demographics_df['Diagnosis_encoded']))
-
-
-# --- Prepare File Paths and Labels ---
-
-def get_paths_and_labels(mri_ids, mri_map):
-    paths = []
-    labels = []
-    axl_dir = 'axl'
-    
-    for filename in os.listdir(axl_dir):
-        if filename.endswith('.nii'):
-            mri_id = filename.replace('_axl.nii', '')
-            if mri_id in mri_ids and mri_id in mri_map:
-                paths.append(os.path.join(axl_dir, filename))
-                labels.append(mri_map[mri_id])
-    return paths, labels
-
-x_train_paths, y_train_labels = get_paths_and_labels(train_mri_ids, mri_diagnosis_map)
-x_val_paths, y_val_labels = get_paths_and_labels(val_mri_ids, mri_diagnosis_map)
-x_test_paths, y_test_labels = get_paths_and_labels(test_mri_ids, mri_diagnosis_map)
-
-
-# --- Data Loading and Processing ---
+# --- 1. Data Loading Utility ---
 image_size = (128, 128)
 
-def load_and_process_images(paths):
+def load_images(paths):
     """Loads and resizes NIfTI images."""
     data = []
     for path in paths:
-        try:
+        if os.path.exists(path):
             nifti_img = nib.load(path)
             img_data = nifti_img.get_fdata()
-
-            # Handle 2D images directly
             if img_data.ndim == 2:
                 resized_img = resize(img_data, image_size, anti_aliasing=True)
-                # Convert to 3 channels for model compatibility
-                img_array = np.stack([resized_img, resized_img, resized_img], axis=-1)
-                data.append(img_array)
+                data.append(resized_img)
             else:
-                print(f"Skipping {path}: Expected 2D image, got {img_data.ndim}D.")
-        except Exception as e:
-            print(f"Error loading image {path}: {e}")
+                print(f"Skipping {path}: Not a 2D image.")
+        else:
+            print(f"Skipping {path}: File not found.")
     return np.array(data)
 
-print("Loading and processing images for training, validation, and testing sets...")
-x_train = load_and_process_images(x_train_paths)
-x_val = load_and_process_images(x_val_paths)
-x_test = load_and_process_images(x_test_paths)
+# --- 2. Data Preparation ---
 
-y_train = np.array(y_train_labels)
-y_val = np.array(y_val_labels)
-y_test = np.array(y_test_labels)
+def load_and_prepare_data():
+    """
+    Loads and preprocesses the dataset, splitting it into patient-aware
+    training, validation, and test sets for both images and labels.
+    Returns:
+        (x_train_img, y_train_class, y_train_age), 
+        (x_val_img, y_val_class, y_val_age), 
+        (x_test_img, y_test_class, y_test_age),
+        valid_data_df, # Added return
+        test_patients # Added return
+    """
+    # Read and clean the demographic data
+    demographics_df = pd.read_csv('oasis_longitudinal_demographic.csv', sep=';')
+    demographics_df['CDR'] = demographics_df['CDR'].astype(str).str.replace(',', '.', regex=False)
+    demographics_df['CDR'] = pd.to_numeric(demographics_df['CDR'], errors='coerce')
+    demographics_df['Age'] = pd.to_numeric(demographics_df['Age'], errors='coerce')
 
-print(f"Training set: {x_train.shape[0]} images")
-print(f"Validation set: {x_val.shape[0]} images")
-print(f"Testing set: {x_test.shape[0]} images")
-print("---")
+    # --- Binary Diagnosis for Classification ---
+    def get_diagnosis_binary(row):
+        if row['Group'] == 'Nondemented':
+            return 'NonDemented'
+        elif row['Group'] == 'Demented':
+            return 'Demented'
+        elif row['Group'] == 'Converted':
+            return 'Demented' if row['CDR'] > 0 else 'NonDemented'
+        return 'Unknown'
+
+    demographics_df['Diagnosis'] = demographics_df.apply(get_diagnosis_binary, axis=1)
+    
+    # Filter out unknown diagnoses and missing data
+    valid_data_df = demographics_df[demographics_df['Diagnosis'] != 'Unknown'].dropna(subset=['MRI ID', 'Subject ID', 'Age'])
+
+    # --- Patient-Based Stratified Split ---
+    patient_info = valid_data_df.groupby('Subject ID').agg(
+        final_CDR=('CDR', 'max'),
+        first_visit_age=('Age', 'min')
+    ).reset_index()
+    
+    patient_info['Diagnosis'] = patient_info['final_CDR'].apply(lambda cdr: 'Demented' if cdr > 0 else 'NonDemented')
+    
+    le = LabelEncoder()
+    patient_info['Diagnosis_encoded'] = le.fit_transform(patient_info['Diagnosis'])
+    
+    # Split patients
+    train_val_patients, test_patients = train_test_split(
+        patient_info,
+        test_size=0.2,
+        random_state=42,
+        stratify=patient_info['Diagnosis_encoded']
+    )
+    train_patients, val_patients = train_test_split(
+        train_val_patients,
+        test_size=0.2, # 20% of the 80% train_val set
+        random_state=42,
+        stratify=train_val_patients['Diagnosis_encoded']
+    )
+
+    # --- Get Image Paths and Labels for each set ---
+    def get_set_data(patient_ids_df, full_df):
+        set_df = full_df[full_df['Subject ID'].isin(patient_ids_df['Subject ID'])]
+        paths = [os.path.join('axl', f"{mri_id}_axl.nii") for mri_id in set_df['MRI ID']]
+        class_labels = le.transform(set_df['Diagnosis'])
+        age_labels = set_df['Age'].values
+        return paths, class_labels, age_labels
+
+    train_paths, y_train_class, y_train_age = get_set_data(train_patients, valid_data_df)
+    val_paths, y_val_class, y_val_age = get_set_data(val_patients, valid_data_df)
+    test_paths, y_test_class, y_test_age = get_set_data(test_patients, valid_data_df)
+
+    print("Loading images...")
+    x_train_img = load_images(train_paths)
+    x_val_img = load_images(val_paths)
+    x_test_img = load_images(test_paths)
+    
+    return (x_train_img, y_train_class, y_train_age), (x_val_img, y_val_class, y_val_age), (x_test_img, y_test_class, y_test_age), valid_data_df, test_patients
 
 
-# --- Creating Model: CNN for Binary Classification ---
-print("Creating and compiling the CNN model...")
-model = Sequential()
+# --- 3. Feature Extraction ---
 
-# First Convolutional Block
-model.add(Conv2D(32, kernel_size=(2, 2), input_shape=(image_size[0], image_size[1], 3), padding='same'))
-model.add(Conv2D(32, kernel_size=(2, 2), activation='relu', padding='same'))
-model.add(BatchNormalization())
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Dropout(0.25))
-
-# Second Convolutional Block
-model.add(Conv2D(64, kernel_size=(2, 2), activation='relu', padding='same'))
-model.add(Conv2D(64, kernel_size=(2, 2), activation='relu', padding='same'))
-model.add(BatchNormalization())
-model.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
-model.add(Dropout(0.25))
-
-# Classifier Block
-model.add(Flatten())
-model.add(Dense(512, activation='relu'))
-model.add(Dropout(0.5))
-model.add(Dense(1, activation='sigmoid')) # Binary classification output
-          
-model.compile(loss='binary_crossentropy', optimizer='Adamax', metrics=['accuracy'])
-          
-model.summary()
-print("---")
+def extract_features(images):
+    """Extracts texture features from a list of images."""
+    features = []
+    for img in images:
+        img_8bit = (img * 255).astype(np.uint8)
+        glcm = graycomatrix(img_8bit, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
+        props = [graycoprops(glcm, prop)[0, 0] for prop in ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM']]
+        features.append(props)
+    return np.array(features)
 
 
-# --- Model Training ---
-print("Starting model training...")
-history = model.fit(
-    x_train, 
-    y_train, 
-    epochs=10, 
-    batch_size=10, 
-    verbose=1, 
-    validation_data=(x_val, y_val)
-)
-print("Model training complete.")
-print("---")
+# --- 4. Evaluation Utilities ---
+
+def evaluate_classifier(y_true, y_pred, model_name):
+    """Calculates and prints classification metrics."""
+    cm = confusion_matrix(y_true, y_pred)
+    tn, fp, fn, tp = cm.ravel() if cm.shape == (2, 2) else (0, 0, 0, 0)
+    
+    accuracy = accuracy_score(y_true, y_pred)
+    sensitivity = recall_score(y_true, y_pred) # Recall is sensitivity
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    
+    print(f"--- {model_name} Evaluation ---")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Sensitivity (Recall): {sensitivity:.4f}")
+    print(f"Specificity: {specificity:.4f}")
+    print("Confusion Matrix:")
+    sns.heatmap(cm, annot=True, fmt='d').set(title=f'{model_name} Confusion Matrix')
+    plt.show()
+    print("----------------------------------\n")
+
+def plot_learning_curves(history, model_name):
+    """Plots accuracy learning curves."""
+    plt.figure(figsize=(8, 5))
+    plt.plot(history.history['accuracy'], label='Training Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    plt.title(f'{model_name} Learning Curve')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend(loc='lower right')
+    plt.show()
 
 
-# --- Plot Model Loss ---
-plt.figure(figsize=(8, 5))
-plt.plot(history.history['loss'], label='Training Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
-plt.title('Model Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend(['Training', 'Validation'], loc='upper right')
-plt.show()
-print("Loss plot generated.")
-print("---")
+# --- Main Execution ---
+
+if __name__ == '__main__':
+    # --- Data Loading ---
+    (x_train_img, y_train_class, y_train_age), \
+    (x_val_img, y_val_class, y_val_age), \
+    (x_test_img, y_test_class, y_test_age), \
+    valid_data_df, test_patients = load_and_prepare_data() # Added return values
+
+    print("\n--- TASK 1: CLASSIFICATION (Demented vs. NonDemented) ---")
+    
+    # --- Feature Extraction and Scaling for Shallow Models ---
+    print("Extracting features for shallow classification models...")
+    x_train_features = extract_features(x_train_img)
+    x_test_features = extract_features(x_test_img)
+    print(f"Feature extraction complete. Feature shape: {x_train_features.shape}")
+
+    print("Scaling features...")
+    scaler = StandardScaler()
+    x_train_features_scaled = scaler.fit_transform(x_train_features)
+    x_test_features_scaled = scaler.transform(x_test_features)
+    
+    # --- Shallow Model: SVM Classifier ---
+    print("\nTraining SVM Classifier...")
+    svm_classifier = SVC(kernel='rbf', probability=True, random_state=42)
+    svm_classifier.fit(x_train_features_scaled, y_train_class)
+    y_pred_svm = svm_classifier.predict(x_test_features_scaled)
+    evaluate_classifier(y_test_class, y_pred_svm, "SVM Classifier")
+
+    # --- Deep Model: DenseNet Classifier ---
+    x_train_deep = np.stack([x_train_img, x_train_img, x_train_img], axis=-1)
+    x_val_deep = np.stack([x_val_img, x_val_img, x_val_img], axis=-1)
+    x_test_deep = np.stack([x_test_img, x_test_img, x_test_img], axis=-1)
+
+    print("\nCreating and fine-tuning DenseNet Classifier...")
+    base_model_clf = DenseNet121(weights='imagenet', include_top=False, input_shape=(128, 128, 3))
+    base_model_clf.trainable = False # Freeze base
+    
+    x = Flatten()(base_model_clf.output)
+    x = Dense(512, activation='relu')(x)
+    x = Dropout(0.5)(x)
+    output_clf = Dense(1, activation='sigmoid')(x)
+    
+    model_clf = Model(inputs=base_model_clf.input, outputs=output_clf)
+    model_clf.compile(loss='binary_crossentropy', optimizer='Adamax', metrics=['accuracy'])
+    
+    history_clf = model_clf.fit(
+        x_train_deep, y_train_class,
+        validation_data=(x_val_deep, y_val_class),
+        epochs=10, batch_size=16, verbose=1
+    )
+    
+    plot_learning_curves(history_clf, "DenseNet Classifier")
+    y_pred_deep_clf_proba = model_clf.predict(x_test_deep)
+    y_pred_deep_clf = (y_pred_deep_clf_proba > 0.5).astype(int)
+    evaluate_classifier(y_test_class, y_pred_deep_clf, "DenseNet Classifier")
 
 
-# --- Example Prediction ---
-print("Prediction Example")
-# Use a random image from the test set
-try:
-    if len(x_test) > 0:
-        idx = np.random.randint(0, len(x_test))
-        img_array = x_test[idx]
-        true_label = y_test[idx]
-        
-        # Reshape for prediction
-        x = img_array.reshape(1, image_size[0], image_size[1], 3)
-        
-        # Predict
-        res = model.predict(x)[0][0]
-        predicted_label = 1 if res > 0.5 else 0
-        
-        # Display image and result
-        plt.figure(figsize=(4, 4))
-        imshow(img_array[:, :, 0], cmap='gray') # Show one channel
-        plt.title(f"True: {'Demented' if true_label == 1 else 'NonDemented'}, Predicted: {'Demented' if predicted_label == 1 else 'NonDemented'}")
-        plt.show()
-        
-        print(f"Prediction confidence: {res*100:.2f}% Demented")
+    print("\n--- TASK 2: REGRESSION (Predicting Patient Age) ---")
+
+    # --- Shallow Model: XGBoost Regressor ---
+    print("\nTraining XGBoost Regressor...")
+    xgb_regressor = xgb.XGBRegressor(objective='reg:squarederror', random_state=42)
+    # Note: Using scaled features as well for the regressor
+    xgb_regressor.fit(x_train_features_scaled, y_train_age)
+    y_pred_age_xgb = xgb_regressor.predict(x_test_features_scaled)
+    mae_xgb = mean_absolute_error(y_test_age, y_pred_age_xgb)
+    print(f"--- XGBoost Regressor Evaluation ---")
+    print(f"Mean Absolute Error (MAE): {mae_xgb:.4f} years")
+    print("------------------------------------\n")
+
+    # --- Deep Model: DenseNet Regressor ---
+    print("\nCreating and fine-tuning DenseNet Regressor...")
+    base_model_reg = DenseNet121(weights='imagenet', include_top=False, input_shape=(128, 128, 3))
+    base_model_reg.trainable = False
+    
+    x_reg = Flatten()(base_model_reg.output)
+    x_reg = Dense(512, activation='relu')(x_reg)
+    x_reg = Dropout(0.5)(x_reg)
+    output_reg = Dense(1, activation='linear')(x_reg) # Linear activation for regression
+    
+    model_reg = Model(inputs=base_model_reg.input, outputs=output_reg)
+    model_reg.compile(loss='mean_squared_error', optimizer='Adamax', metrics=['mae'])
+    
+    history_reg = model_reg.fit(
+        x_train_deep, y_train_age,
+        validation_data=(x_val_deep, y_val_age),
+        epochs=10, batch_size=16, verbose=1
+    )
+    
+    y_pred_age_deep = model_reg.predict(x_test_deep).flatten()
+    mae_deep = mean_absolute_error(y_test_age, y_pred_age_deep)
+    print(f"--- DenseNet Regressor Evaluation ---")
+    print(f"Mean Absolute Error (MAE): {mae_deep:.4f} years")
+    print("-------------------------------------\n")
+
+    # --- Analysis Questions ---
+    print("\n--- Analysis Questions ---")
+    print("1. Are the inputs sufficient for a good prediction?")
+    print(f"For age prediction, the shallow model (XGBoost) had an MAE of {mae_xgb:.2f} years, and the deep model (DenseNet) had an MAE of {mae_deep:.2f} years. This indicates the models have some predictive power, but there's room for improvement. The image features seem to provide a reasonable but not perfect estimation of age.")
+    
+    print("\n2. Do later visits result in higher predicted ages?")
+    
+    # Re-fetch the test set data needed for this analysis, now that valid_data_df and test_patients are available
+    test_analysis_df = valid_data_df[valid_data_df['Subject ID'].isin(test_patients['Subject ID'])].copy()
+    test_analysis_paths = [os.path.join('axl', f"{mri_id}_axl.nii") for mri_id in test_analysis_df['MRI ID']]
+    x_test_img_analysis = load_images(test_analysis_paths)
+    x_test_features_analysis = extract_features(x_test_img_analysis)
+    x_test_features_analysis_scaled = scaler.transform(x_test_features_analysis) # Use the same scaler fitted on training data
+    
+    test_analysis_df['predicted_age_xgb'] = xgb_regressor.predict(x_test_features_analysis_scaled)
+    
+    consistent_increase = 0
+    total_patients_mv = 0
+    
+    # Sort by Subject ID and then by Visit to ensure correct order for diff
+    for subject_id, group in test_analysis_df.sort_values(['Subject ID', 'Visit']).groupby('Subject ID'):
+        if len(group) > 1: # Only consider patients with multiple visits
+            total_patients_mv += 1
+            predicted_ages = group['predicted_age_xgb'].values
+            if np.all(np.diff(predicted_ages) >= 0):
+                consistent_increase += 1
+    
+    if total_patients_mv > 0:
+        consistency_ratio = consistent_increase / total_patients_mv
+        print(f"For the XGBoost regressor, {consistency_ratio:.2%} of patients with multiple visits showed consistently non-decreasing predicted ages.")
     else:
-        print("Skipping Example Prediction: No test images found.")
-except Exception as e:
-    print(f"An error occurred during Prediction Example: {e}")
-print("---")
+        print("Not enough data with multiple visits in the test set to perform this analysis.")
+    print("--------------------------")
