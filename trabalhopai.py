@@ -160,10 +160,85 @@ def plot_learning_curves(history, model_name):
     plt.legend(loc='lower right')
     plt.show()
 
+def plot_mri_image(mri_id):
+    """
+    Loads and plots all slices from a .nii or .nii.gz MRI file.
+    
+    Parameters
+    ----------
+    filepath : str
+        Path to the .nii or .nii.gz file.
+    """
+    set_df = pd.read_csv('oasis_longitudinal_demographic.csv', sep=';')
+    paths = [os.path.join('axl', f"{mri_id}_axl.nii") for mri_id in set_df['MRI ID']]
+    # Load the NIfTI file
+    filepath=paths[0]
+    img = nib.load(filepath)
+    data = img.get_fdata()
+
+    # Ensure data is 3D
+    img = nib.load(filepath)
+    data = img.get_fdata()
+    header = img.header
+    affine = img.affine
+
+    # ================================
+    # PRINT METADATA
+    # ================================
+    print("\n=== MRI METADATA ===")
+    print(f"File: {filepath}")
+    print(f"Shape: {data.shape}")
+    print(f"Data Type: {header.get_data_dtype()}")
+    print(f"Voxel Dimensions (pixdim): {header['pixdim'][1:4]}")
+    print("\n--- Full Header ---")
+    print(header)   # prints ALL metadata fields
+
+    print("\n--- Affine Matrix (qform/sform) ---")
+    print(affine)
+
+    # -----------------------------
+    # CASE 1 → 2D IMAGE (single slice)
+    # -----------------------------
+    if data.ndim == 2:
+        plt.figure(figsize=(6, 6))
+        plt.imshow(data, cmap='gray')
+        plt.title(f"{mri_id} - Single Slice (2D)")
+        plt.axis("off")
+        plt.show()
+        return
+
+
+    
+    # -----------------------------
+    # CASE 2 → 3D IMAGE (multiple slices)
+    # -----------------------------
+    if data.ndim == 3:
+        num_slices = data.shape[2]
+
+        cols = 8
+        rows = int(np.ceil(num_slices / cols))
+
+        plt.figure(figsize=(15, rows * 2))
+
+        for i in range(num_slices):
+            plt.subplot(rows, cols, i + 1)
+            plt.imshow(data[:, :, i], cmap='gray')
+            plt.axis("off")
+
+        plt.suptitle(f"{mri_id} - All Slices")
+        plt.tight_layout()
+        plt.show()
+        return
+
+    # -----------------------------
+    # OTHER CASES (rare)
+    # -----------------------------
+    raise ValueError(f"Unexpected MRI shape: {data.shape}")
 
 # --- Main Execution ---
 
 if __name__ == '__main__':
+    plot_mri_image("OAS2_0001")
     # --- Data Loading ---
     (x_train_img, y_train_class, y_train_age), \
     (x_val_img, y_val_class, y_val_age), \
