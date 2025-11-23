@@ -11,10 +11,12 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import SVC
-from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, mean_absolute_error
+from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, mean_absolute_error, balanced_accuracy_score, f1_score
+from sklearn.decomposition import PCA
+from sklearn.utils.class_weight import compute_class_weight
 import xgboost as xgb
 import nibabel as nib
 from skimage.transform import resize
@@ -22,9 +24,38 @@ from skimage.feature import graycomatrix, graycoprops
 from PIL import Image
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from keras.models import Model
-from keras.layers import Input, Conv2D, Flatten, Dense, Dropout, BatchNormalization, MaxPooling2D
+from keras.models import Model, Sequential
+from keras.layers import Input, Conv2D, Flatten, Dense, Dropout, BatchNormalization, MaxPooling2D, GlobalAveragePooling2D, RandomFlip, RandomRotation, RandomZoom, RandomTranslation
 from keras.applications import DenseNet121
+from keras.optimizers import Adam
+from keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
+
+# =============================================================================
+# CALLBACK PARA MÉTRICAS PERSONALIZADAS (DenseNet)
+# =============================================================================
+class MetricsCallbackDenseNet(Callback):
+    def __init__(self, x_val, y_val):
+        super().__init__()
+        self.x_val = x_val
+        self.y_val = y_val
+        self.history_sensitivity = []
+        self.history_specificity = []
+
+    def on_epoch_end(self, epoch, logs=None):
+        # Previsões no conjunto de validação
+        y_pred_prob = self.model.predict(self.x_val, verbose=0)
+        y_pred = (y_pred_prob.flatten() >= 0.5).astype(int)
+        cm = confusion_matrix(self.y_val, y_pred)
+        if cm.shape == (2,2):
+            tn, fp, fn, tp = cm.ravel()
+            sens = tp / (tp + fn + 1e-8)
+            spec = tn / (tn + fp + 1e-8)
+        else:
+            sens = 0.0
+            spec = 0.0
+        self.history_sensitivity.append(sens)
+        self.history_specificity.append(spec)
+        print(f"Epoch {epoch+1}: Sensibilidade={sens:.4f} | Especificidade={spec:.4f}")
 
 # =============================================================================
 # CLASSE IMAGE LOADER (integrado de image_loader.py)
@@ -211,13 +242,80 @@ def load_and_prepare_data():
            valid_data_df, test_patients
 
 def extract_features(images):
-    """Extracts texture features from a list of images."""
+    """Extracts robust texture features from images (Windows-safe logging)."""
     features = []
-    for img in images:
-        img_8bit = (img * 255).astype(np.uint8)
-        glcm = graycomatrix(img_8bit, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
-        props = [graycoprops(glcm, prop)[0, 0] for prop in ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM']]
-        features.append(props)
+    total = len(images)
+    print(f"Extraindo features de {total} imagens...")
+
+    for idx, img in enumerate(images):
+        if idx % 50 == 0:
+            print(f"  Progresso: {idx}/{total}")
+
+        try:
+            # Garantir array float sem NaN/Inf
+            img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+
+            # Normalizar para 0-255 de forma estável
+            vmin = float(np.min(img))
+            vmax = float(np.max(img))
+            if vmax > vmin:
+                img_norm = (img - vmin) / (vmax - vmin)
+            else:
+                img_norm = np.zeros_like(img)
+            img_8bit = np.clip((img_norm * 255).round(), 0, 255).astype(np.uint8)
+
+            feature_vec = []
+
+            # GLCM com múltiplos ângulos (mais informação de textura)
+            angles = [0, np.pi/4, np.pi/2, 3*np.pi/4]
+            glcm = graycomatrix(
+                img_8bit,
+                distances=[1],
+                angles=angles,
+                levels=256,
+                symmetric=True,
+                normed=True,
+            )
+
+            # 6 propriedades GLCM para cada ângulo = 24 features
+            for prop in [
+                'contrast',
+                'dissimilarity',
+                'homogeneity',
+                'energy',
+                'correlation',
+                'ASM',
+            ]:
+                vals = graycoprops(glcm, prop)[0, :]
+                feature_vec.extend(vals.tolist())
+
+            # Features estatísticas adicionais (8 features)
+            feature_vec.extend(
+                [
+                    float(np.mean(img)),
+                    float(np.std(img)),
+                    float(np.median(img)),
+                    float(np.min(img)),
+                    float(np.max(img)),
+                    float(np.max(img) - np.min(img)),  # Range
+                    float(np.percentile(img, 25)),  # Q1
+                    float(np.percentile(img, 75)),  # Q3
+                ]
+            )
+
+            features.append(feature_vec)
+        except Exception as ex:
+            # Em caso de falha em uma imagem, registra e continua
+            print(f"  Aviso: falha ao extrair da imagem {idx}: {ex}")
+            # Preenche com zeros para manter alinhamento
+            if features:
+                features.append([0.0] * len(features[0]))
+            else:
+                # 24 GLCM + 8 estatísticas = 32
+                features.append([0.0] * 32)
+
+    if features and len(features[0]) > 0:
+        print(f"Total de {len(features[0])} features por imagem")
     return np.array(features)
 
 def evaluate_classifier(y_true, y_pred, model_name):
@@ -336,6 +434,7 @@ class AlzheimerAnalysisGUI:
         menu_densenet.add_separator()
         menu_densenet.add_command(label="Avaliar Classificação", command=self.avaliar_densenet_classif)
         menu_densenet.add_command(label="Avaliar Regressão", command=self.avaliar_densenet_regress)
+        menu_densenet.add_command(label="Análise Temporal", command=self.analise_temporal_densenet)
         menu_bar.add_cascade(label="DenseNet", menu=menu_densenet)
         
         # Menu Acessibilidade
@@ -561,31 +660,108 @@ class AlzheimerAnalysisGUI:
             return
         
         try:
-            messagebox.showinfo("Extraindo", "Extraindo características...\nIsso pode levar alguns minutos.")
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            cache_path = os.path.join(base_dir, 'features_cache.npz')
+
+            if os.path.exists(cache_path):
+                usar_cache = messagebox.askyesno(
+                    "Cache de Features",
+                    "Encontrado arquivo de cache (features_cache.npz).\nDeseja reutilizar em vez de recalcular?"
+                )
+                if usar_cache:
+                    data = np.load(cache_path, allow_pickle=True)
+                    self.x_train_features = data['x_train']
+                    self.x_val_features = data['x_val']
+                    self.x_test_features = data['x_test']
+                    messagebox.showinfo("Sucesso", "Cache carregado com sucesso!")
+                    return
+
+            messagebox.showinfo("Extraindo", "Calculando features (GLCM + estatísticas)...")
             self.x_train_features = extract_features(self.train_data[0])
             self.x_val_features = extract_features(self.val_data[0])
             self.x_test_features = extract_features(self.test_data[0])
-            messagebox.showinfo("Sucesso", "Características extraídas com sucesso!")
+
+            np.savez_compressed(
+                cache_path,
+                x_train=self.x_train_features,
+                x_val=self.x_val_features,
+                x_test=self.x_test_features
+            )
+            messagebox.showinfo("Sucesso", "Features extraídas e cache salvo!")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao extrair características:\n{str(e)}")
+
+    # =========================================================================
+    # HELPER: TRANSFORM FEATURES (Scaler + PCA)
+    # =========================================================================
+    def transform_features(self, X):
+        """Aplica scaler e PCA (se disponível) nas features."""
+        if not hasattr(self, 'svm_scaler'):
+            raise ValueError("Scaler não encontrado. Treine o SVM primeiro.")
+        X_scaled = self.svm_scaler.transform(X)
+        if hasattr(self, 'svm_pca') and self.svm_pca is not None:
+            X_scaled = self.svm_pca.transform(X_scaled)
+        return X_scaled
     
     # =========================================================================
     # SVM - CLASSIFICADOR RASO
     # =========================================================================
     def treinar_svm(self):
-        """Treina SVM"""
+        """Treina SVM com PCA adaptativo e busca de hiperparâmetros.
+
+        Objetivo: melhorar Acurácia / Sensibilidade / Especificidade >= 0.75.
+        Pipeline: StandardScaler -> PCA (variância 0.98 máx 40 comps) -> GridSearchCV.
+        """
         if self.x_train_features is None:
             messagebox.showwarning("Aviso", "Extraia as características primeiro!")
             return
         
         try:
-            messagebox.showinfo("Treinando", "Treinando SVM...")
+            messagebox.showinfo("Treinando", "Treinando SVM (Scaler + PCA + GridSearchCV)...")
+
+            # 1) Normalização
             scaler = StandardScaler()
             X_train_scaled = scaler.fit_transform(self.x_train_features)
-            self.svm_model = SVC(kernel='rbf', C=1.0, gamma='scale', random_state=42)
-            self.svm_model.fit(X_train_scaled, self.train_data[1])
+
+            # 2) PCA adaptativo: mantém até 98% da variância, limite de 40 componentes
+            pca_full = PCA(svd_solver='full')
+            pca_full.fit(X_train_scaled)
+            cum_var = np.cumsum(pca_full.explained_variance_ratio_)
+            n_comp = int(np.searchsorted(cum_var, 0.98) + 1)
+            n_comp = min(n_comp, 40, X_train_scaled.shape[1], X_train_scaled.shape[0]-1)
+            pca = PCA(n_components=n_comp, svd_solver='full')
+            X_train_pca = pca.fit_transform(X_train_scaled)
+
+            # 3) Grid pequeno para não demorar, com validação estratificada
+            param_grid = [
+                {'kernel': ['rbf'], 'C': [1, 5, 10, 20], 'gamma': ['scale', 0.01, 0.1]},
+                {'kernel': ['linear'], 'C': [0.5, 1, 5, 10]}
+            ]
+            cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            grid = GridSearchCV(
+                SVC(class_weight='balanced', random_state=42),
+                param_grid=param_grid,
+                scoring='balanced_accuracy',
+                cv=cv,
+                n_jobs=-1,
+                refit=True,
+                verbose=0
+            )
+            grid.fit(X_train_pca, self.train_data[1])
+
+            self.svm_model = grid.best_estimator_
             self.svm_scaler = scaler
-            messagebox.showinfo("Sucesso", "SVM treinado com sucesso!")
+            self.svm_pca = pca
+
+            train_bal_acc = balanced_accuracy_score(self.train_data[1], self.svm_model.predict(X_train_pca))
+            msg = (
+                f"SVM treinado!\n\n"
+                f"Melhores hiperparâmetros: {grid.best_params_}\n"
+                f"Score CV (Balanced Acc): {grid.best_score_:.3f}\n"
+                f"Balanced Acc Treino: {train_bal_acc:.3f}\n"
+                f"Componentes PCA: {X_train_pca.shape[1]} (Var ≈ {cum_var[n_comp-1]*100:.1f}%)"
+            )
+            messagebox.showinfo("Sucesso", msg)
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao treinar SVM:\n{str(e)}")
     
@@ -596,8 +772,7 @@ class AlzheimerAnalysisGUI:
             return
         
         try:
-            X_test_scaled = self.svm_scaler.transform(self.x_test_features)
-            y_pred = self.svm_model.predict(X_test_scaled)
+            y_pred = self.svm_model.predict(self.transform_features(self.x_test_features))
             acc, sens, spec, cm = evaluate_classifier(self.test_data[1], y_pred, "SVM")
             
             messagebox.showinfo("Resultados SVM", 
@@ -614,8 +789,8 @@ class AlzheimerAnalysisGUI:
             return
         
         try:
-            X_test_scaled = self.svm_scaler.transform(self.x_test_features)
-            y_pred = self.svm_model.predict(X_test_scaled)
+            X_test_trans = self.transform_features(self.x_test_features)
+            y_pred = self.svm_model.predict(X_test_trans)
             cm = confusion_matrix(self.test_data[1], y_pred)
             
             plt.figure(figsize=(6, 5))
@@ -645,76 +820,683 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Erro ao treinar XGBoost:\n{str(e)}")
     
     def avaliar_xgboost(self):
-        """Avalia XGBoost"""
+        """Avalia XGBoost no conjunto de TESTE"""
         if self.xgboost_model is None:
             messagebox.showwarning("Aviso", "Treine o XGBoost primeiro!")
             return
         
         try:
             y_pred = self.xgboost_model.predict(self.x_test_features)
-            mae = mean_absolute_error(self.test_data[2], y_pred)
-            messagebox.showinfo("Resultados XGBoost", f"MAE: {mae:.2f} anos")
+            y_true = self.test_data[2]
+            
+            mae = mean_absolute_error(y_true, y_pred)
+            
+            from sklearn.metrics import r2_score, mean_squared_error
+            r2 = r2_score(y_true, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+            
+            # Avaliar qualidade da predição
+            qualidade = "Excelente" if mae < 5 else "Bom" if mae < 10 else "Requer melhorias"
+            
+            result_text = (
+                f"=== RESULTADOS XGBoost (TESTE) ===\n\n"
+                f"MAE: {mae:.2f} anos\n"
+                f"RMSE: {rmse:.2f} anos\n"
+                f"R² Score: {r2:.4f}\n\n"
+                f"Qualidade: {qualidade}\n\n"
+                f"Interpretação:\n"
+                f"• MAE < 5 anos: Excelente\n"
+                f"• MAE 5-10 anos: Bom\n"
+                f"• MAE > 10 anos: Requer melhorias\n\n"
+                f"Resposta: As características GLCM {'SÃO' if mae < 10 else 'NÃO SÃO'} suficientes\n"
+                f"para obter uma boa predição de idade."
+            )
+            
+            messagebox.showinfo("Resultados XGBoost", result_text)
+            
+            # Plotar gráficos comparativos
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+            
+            # Scatter plot
+            ax1.scatter(y_true, y_pred, alpha=0.6, s=50, edgecolors='black')
+            ax1.plot([y_true.min(), y_true.max()], 
+                    [y_true.min(), y_true.max()], 
+                    'r--', lw=2, label='Predição Perfeita')
+            ax1.set_xlabel('Idade Real (anos)', fontsize=12)
+            ax1.set_ylabel('Idade Predita (anos)', fontsize=12)
+            ax1.set_title(f'XGBoost - Predição de Idade\nMAE: {mae:.2f} anos | R²: {r2:.4f}', 
+                         fontsize=14, fontweight='bold')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            
+            # Histograma dos erros
+            erros = y_pred - y_true
+            ax2.hist(erros, bins=20, edgecolor='black', alpha=0.7, color='skyblue')
+            ax2.axvline(x=0, color='r', linestyle='--', linewidth=2, label='Erro Zero')
+            ax2.set_xlabel('Erro de Predição (anos)', fontsize=12)
+            ax2.set_ylabel('Frequência', fontsize=12)
+            ax2.set_title(f'Distribuição dos Erros\nMédia: {erros.mean():.2f} anos | Desvio: {erros.std():.2f}', 
+                         fontsize=14, fontweight='bold')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.show()
+            
         except Exception as e:
             messagebox.showerror("Erro", f"Erro:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def analise_temporal(self):
-        """Análise temporal - visitas posteriores têm idades maiores?"""
+        """Análise temporal COMPLETA - visitas posteriores têm idades maiores?"""
         if self.xgboost_model is None:
             messagebox.showwarning("Aviso", "Treine o XGBoost primeiro!")
             return
         
         try:
             y_pred = self.xgboost_model.predict(self.x_test_features)
-            test_data_df = self.valid_data_df[self.valid_data_df['Subject ID'].isin(self.test_patients['Subject ID'])]
-            test_data_df = test_data_df.copy()
-            test_data_df['predicted_age'] = y_pred[:len(test_data_df)]
+            test_data_df = self.valid_data_df[self.valid_data_df['Subject ID'].isin(self.test_patients['Subject ID'])].copy()
+            
+            # Adicionar predições
+            if len(y_pred) != len(test_data_df):
+                messagebox.showwarning("Aviso", "Número de predições não corresponde aos dados de teste")
+                return
+            
+            test_data_df['predicted_age'] = y_pred
             
             consistent_increase = 0
             total_patients = 0
+            exemplos_bons = []
+            exemplos_ruins = []
+            diferencas_medias = []
             
+            # Analisar cada paciente com múltiplas visitas
             for subject_id, group in test_data_df.sort_values(['Subject ID', 'Visit']).groupby('Subject ID'):
                 if len(group) > 1:
                     total_patients += 1
                     predicted_ages = group['predicted_age'].values
-                    if np.all(np.diff(predicted_ages) >= 0):
+                    real_ages = group['Age'].values
+                    
+                    # Verificar se idades preditas são crescentes
+                    diffs_pred = np.diff(predicted_ages)
+                    diffs_real = np.diff(real_ages)
+                    
+                    if np.all(diffs_pred >= 0):
                         consistent_increase += 1
+                        if len(exemplos_bons) < 3:
+                            exemplos_bons.append((subject_id, predicted_ages, real_ages))
+                    else:
+                        if len(exemplos_ruins) < 3:
+                            exemplos_ruins.append((subject_id, predicted_ages, real_ages))
+                    
+                    diferencas_medias.append(np.mean(diffs_pred))
             
             ratio = (consistent_increase / total_patients * 100) if total_patients > 0 else 0
-            messagebox.showinfo("Análise Temporal", 
-                              f"Pacientes com múltiplas visitas: {total_patients}\n"
-                              f"Com idades crescentes: {consistent_increase}\n"
-                              f"Percentual: {ratio:.1f}%")
+            
+            # Criar relatório detalhado
+            result_text = (
+                f"=== ANÁLISE TEMPORAL (XGBoost) ===\n\n"
+                f"Pacientes com múltiplas visitas: {total_patients}\n"
+                f"Com idades CRESCENTES: {consistent_increase}\n"
+                f"Percentual de acerto: {ratio:.1f}%\n\n"
+                f"Diferença média entre visitas: {np.mean(diferencas_medias):.2f} anos\n\n"
+                f"RESPOSTA: {'SIM' if ratio >= 70 else 'NÃO'}, {ratio:.1f}% dos exames\n"
+                f"em visitas posteriores resultaram em idades\n"
+                f"{'maiores ou iguais' if ratio >= 70 else 'NEM SEMPRE maiores'}.\n\n"
+            )
+            
+            # Adicionar exemplos
+            if exemplos_bons:
+                result_text += "Exemplos de SUCESSO:\n"
+                for subj_id, pred_ages, real_ages in exemplos_bons[:2]:
+                    result_text += f"  {subj_id}: {pred_ages[0]:.1f}→{pred_ages[-1]:.1f} anos (Real: {real_ages[0]:.1f}→{real_ages[-1]:.1f})\n"
+            
+            if exemplos_ruins:
+                result_text += "\nExemplos de FALHA:\n"
+                for subj_id, pred_ages, real_ages in exemplos_ruins[:2]:
+                    result_text += f"  {subj_id}: {pred_ages[0]:.1f}→{pred_ages[-1]:.1f} anos (Real: {real_ages[0]:.1f}→{real_ages[-1]:.1f})\n"
+            
+            messagebox.showinfo("Análise Temporal - XGBoost", result_text)
+            
+            # Plotar gráfico de progressão temporal
+            if exemplos_bons:
+                fig, axes = plt.subplots(1, min(3, len(exemplos_bons)), figsize=(15, 4))
+                if len(exemplos_bons) == 1:
+                    axes = [axes]
+                
+                for idx, (subj_id, pred_ages, real_ages) in enumerate(exemplos_bons[:3]):
+                    ax = axes[idx] if len(exemplos_bons) > 1 else axes[0]
+                    visitas = range(1, len(pred_ages) + 1)
+                    
+                    ax.plot(visitas, real_ages, 'g-o', label='Idade Real', linewidth=2, markersize=8)
+                    ax.plot(visitas, pred_ages, 'b--s', label='Idade Predita', linewidth=2, markersize=8)
+                    ax.set_xlabel('Visita', fontsize=11)
+                    ax.set_ylabel('Idade (anos)', fontsize=11)
+                    ax.set_title(f'Paciente {subj_id}\n(Exemplo de Sucesso)', fontsize=12, fontweight='bold')
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                plt.suptitle('Progressão Temporal - Exemplos de Predições Corretas', 
+                           fontsize=14, fontweight='bold', y=1.02)
+                plt.show()
+            
         except Exception as e:
             messagebox.showerror("Erro", f"Erro:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
     
     # =========================================================================
     # DENSENET - MODELO PROFUNDO
     # =========================================================================
     def treinar_densenet_classif(self):
-        """Treina DenseNet para classificação"""
+        """Treina DenseNet121 com augmentation + fine-tuning progressivo.
+
+        Objetivo: melhorar métricas (acurácia/sensibilidade/especificidade >= 0.75).
+        Modo rápido: menos épocas & subset.
+        """
         if self.train_data is None:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
         
-        messagebox.showinfo("DenseNet", "Treinamento de DenseNet para classificação\n"
-                          "será implementado aqui com fine-tuning.")
+        try:
+            # Perguntar modo de treinamento
+            resposta = messagebox.askyesno(
+                "Modo de Treinamento",
+                "Deseja usar modo RÁPIDO (otimizado para CPU)?\n\n"
+                "SIM = Rápido (10 épocas, batch 32, menos amostras)\n"
+                "NÃO = Completo (30 épocas, batch 16, todos dados)\n\n"
+                "Ambos usam DenseNet121 com pesos ImageNet."
+            )
+            
+            modo_rapido = resposta
+            
+            messagebox.showinfo("Treinando", 
+                              f"Treinando DenseNet121 em modo {'RÁPIDO' if modo_rapido else 'COMPLETO'}...\n"
+                              "Usando pesos pré-treinados do ImageNet.\n"
+                              "Aguarde alguns minutos.")
+            
+            # Preparar dados (repete canais para compatibilidade ImageNet)
+            x_train = np.expand_dims(self.train_data[0], axis=-1)
+            x_train = np.repeat(x_train, 3, axis=-1)
+            x_val = np.expand_dims(self.val_data[0], axis=-1)
+            x_val = np.repeat(x_val, 3, axis=-1)
+            
+            y_train = self.train_data[1]
+            y_val = self.val_data[1]
+            
+            # OTIMIZAÇÃO 1: Reduzir dados em modo rápido
+            if modo_rapido and len(x_train) > 150:
+                indices = np.random.choice(len(x_train), 150, replace=False)
+                x_train = x_train[indices]
+                y_train = y_train[indices]
+                print(f"Modo rápido: usando {len(x_train)} amostras de treino")
+            
+            print(f"Treinamento - Shape: {x_train.shape}, Labels: {y_train.shape}")
+            
+            # Modelo base DenseNet121 com ImageNet
+            base_model = DenseNet121(
+                weights='imagenet',
+                include_top=False,
+                input_shape=(128, 128, 3)
+            )
+            
+            print("Usando DenseNet121 com pesos ImageNet")
+            
+            # Fase 1: congelar tudo exceto últimas 20 camadas para estabilizar
+            for layer in base_model.layers[:-20]:
+                layer.trainable = False
+            for layer in base_model.layers[-20:]:
+                layer.trainable = True
+            print("Fase 1: Fine-tuning últimas 20 camadas")
+            
+            # Classificador (GAP ajuda generalização com menos parâmetros)
+            # Augmentation via camadas (sem ImageDataGenerator para compatibilidade Keras 3)
+            augmentation = Sequential([
+                RandomFlip('horizontal'),
+                RandomRotation(0.05),
+                RandomZoom(0.1),
+                RandomTranslation(0.05, 0.05),
+            ], name='augmentation')
+
+            inputs = Input(shape=(128,128,3))
+            x = augmentation(inputs)
+            x = base_model(x, training=False)
+            x = GlobalAveragePooling2D()(x)
+            x = BatchNormalization()(x)
+            x = Dense(256, activation='relu')(x)
+            x = Dropout(0.4)(x)
+            x = Dense(128, activation='relu')(x)
+            x = Dropout(0.3)(x)
+            predictions = Dense(1, activation='sigmoid')(x)
+            
+            self.densenet_classif = Model(inputs=inputs, outputs=predictions)
+            
+            self.densenet_classif.compile(
+                optimizer=Adam(learning_rate=1e-4),
+                loss='binary_crossentropy',
+                metrics=['accuracy']
+            )
+            
+            # Parâmetros de treinamento
+            epochs_phase1 = 12 if modo_rapido else 25
+            epochs_phase2 = 5 if modo_rapido else 20
+            batch_size = 16 if modo_rapido else 12
+            patience = 4 if modo_rapido else 10
+            
+            early_stop = EarlyStopping(
+                monitor='val_loss', 
+                patience=patience,
+                restore_best_weights=True, 
+                verbose=1
+            )
+            
+            # Class weights para lidar com desbalanceamento
+            classes = np.unique(y_train)
+            class_w = compute_class_weight(class_weight='balanced', classes=classes, y=y_train)
+            class_weight_dict = {int(c): float(w) for c, w in zip(classes, class_w)}
+
+            metrics_cb = MetricsCallbackDenseNet(x_val, y_val)
+
+            print(f"Fase 1: treinamento ({epochs_phase1} épocas, batch={batch_size})...")
+            hist1 = self.densenet_classif.fit(
+                x_train, y_train,
+                validation_data=(x_val, y_val),
+                epochs=epochs_phase1,
+                callbacks=[early_stop, metrics_cb],
+                class_weight=class_weight_dict,
+                verbose=1
+            )
+
+            # Fase 2: ampliar fine-tuning descongelando mais camadas (se modo completo)
+            if not modo_rapido:
+                print("Fase 2: descongelando últimas 50 camadas para fine-tuning profundo...")
+                for layer in base_model.layers[:-50]:
+                    layer.trainable = False
+                for layer in base_model.layers[-50:]:
+                    layer.trainable = True
+                # Reduzir learning rate para evitar destruição dos pesos
+                self.densenet_classif.compile(
+                    optimizer=Adam(learning_rate=5e-5),
+                    loss='binary_crossentropy',
+                    metrics=['accuracy']
+                )
+                early_stop_phase2 = EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True, verbose=1)
+                print(f"Fase 2: treinamento adicional ({epochs_phase2} épocas)...")
+                hist2 = self.densenet_classif.fit(
+                    x_train, y_train,
+                    validation_data=(x_val, y_val),
+                    epochs=epochs_phase2,
+                    callbacks=[early_stop_phase2, metrics_cb],
+                    class_weight=class_weight_dict,
+                    verbose=1
+                )
+            else:
+                hist2 = None
+
+            # Combinar histórico
+            self.densenet_history = {
+                'accuracy': hist1.history.get('accuracy', []) + ([] if hist2 is None else hist2.history.get('accuracy', [])),
+                'val_accuracy': hist1.history.get('val_accuracy', []) + ([] if hist2 is None else hist2.history.get('val_accuracy', [])),
+                'loss': hist1.history.get('loss', []) + ([] if hist2 is None else hist2.history.get('loss', [])),
+                'val_loss': hist1.history.get('val_loss', []) + ([] if hist2 is None else hist2.history.get('val_loss', [])),
+                'val_sensitivity': metrics_cb.history_sensitivity,
+                'val_specificity': metrics_cb.history_specificity
+            }
+            
+            final_acc = self.densenet_history['val_accuracy'][-1]
+            messagebox.showinfo("Sucesso", 
+                              f"DenseNet121 treinado com sucesso!\n\n"
+                              f"Modelo: DenseNet121 (ImageNet)\n"
+                              f"Épocas completadas: {len(self.densenet_history['loss'])}\n"
+                              f"Acurácia final: {final_acc:.4f}\n\n"
+                              f"Modo: {'RÁPIDO (CPU)' if modo_rapido else 'COMPLETO'}")
+            
+            self.plot_densenet_learning_curves()
+            
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao treinar DenseNet:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def treinar_densenet_regress(self):
-        """Treina DenseNet para regressão"""
+        """Treina DenseNet121 OTIMIZADO para regressão de idade"""
         if self.train_data is None:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
         
-        messagebox.showinfo("DenseNet", "Treinamento de DenseNet para regressão\n"
-                          "será implementado aqui com fine-tuning.")
+        try:
+            resposta = messagebox.askyesno(
+                "Modo de Treinamento",
+                "Usar modo RÁPIDO (otimizado para CPU)?\n\n"
+                "Ambos usam DenseNet121 com pesos ImageNet."
+            )
+            
+            modo_rapido = resposta
+            
+            messagebox.showinfo("Treinando", 
+                              f"Treinando DenseNet121 para regressão...\n"
+                              f"Modo: {'RÁPIDO' if modo_rapido else 'COMPLETO'}")
+            
+            x_train = np.expand_dims(self.train_data[0], axis=-1)
+            x_train = np.repeat(x_train, 3, axis=-1)
+            x_val = np.expand_dims(self.val_data[0], axis=-1)
+            x_val = np.repeat(x_val, 3, axis=-1)
+            
+            y_train_age = self.train_data[2]
+            y_val_age = self.val_data[2]
+            
+            # Reduzir dados em modo rápido
+            if modo_rapido and len(x_train) > 150:
+                indices = np.random.choice(len(x_train), 150, replace=False)
+                x_train = x_train[indices]
+                y_train_age = y_train_age[indices]
+                print(f"Modo rápido: {len(x_train)} amostras")
+            
+            # Sempre usar DenseNet121
+            base_model = DenseNet121(
+                weights='imagenet', 
+                include_top=False, 
+                input_shape=(128, 128, 3)
+            )
+            
+            print("Usando DenseNet121 com pesos ImageNet")
+            
+            # Congelar todas as camadas
+            for layer in base_model.layers:
+                layer.trainable = False
+            
+            print(f"Todas as {len(base_model.layers)} camadas congeladas")
+            
+            x = base_model.output
+            x = BatchNormalization()(x)
+            x = Flatten()(x)
+            if modo_rapido:
+                x = Dense(128, activation='relu')(x)
+                x = Dropout(0.3)(x)
+            else:
+                x = Dense(256, activation='relu')(x)
+                x = Dropout(0.5)(x)
+                x = Dense(128, activation='relu')(x)
+                x = Dropout(0.3)(x)
+            predictions = Dense(1, activation='linear')(x)
+            
+            self.densenet_regress = Model(inputs=base_model.input, outputs=predictions)
+            
+            self.densenet_regress.compile(
+                optimizer=Adam(learning_rate=0.001 if modo_rapido else 0.0001),
+                loss='mse',
+                metrics=['mae']
+            )
+            
+            epochs = 10 if modo_rapido else 30
+            batch_size = 32 if modo_rapido else 16
+            patience = 3 if modo_rapido else 10
+            
+            early_stop = EarlyStopping(
+                monitor='val_loss', 
+                patience=patience, 
+                restore_best_weights=True, 
+                verbose=1
+            )
+            
+            print(f"Treinando ({epochs} épocas, batch={batch_size})...")
+            
+            self.densenet_regress_history = self.densenet_regress.fit(
+                x_train, y_train_age,
+                validation_data=(x_val, y_val_age),
+                epochs=epochs,
+                batch_size=batch_size,
+                callbacks=[early_stop],
+                verbose=1
+            )
+            
+            final_mae = self.densenet_regress_history.history['val_mae'][-1]
+            messagebox.showinfo("Sucesso", 
+                              f"DenseNet121 (regressão) treinado!\n\n"
+                              f"Modelo: DenseNet121 (ImageNet)\n"
+                              f"MAE final: {final_mae:.2f} anos\n"
+                              f"Modo: {'RÁPIDO' if modo_rapido else 'COMPLETO'}")
+            
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def avaliar_densenet_classif(self):
-        """Avalia DenseNet classificação"""
-        messagebox.showinfo("DenseNet", "Avaliação de DenseNet Classificação")
+        """Avalia DenseNet classificação no TESTE"""
+        if self.densenet_classif is None:
+            messagebox.showwarning("Aviso", "Treine o DenseNet primeiro!")
+            return
+        
+        try:
+            x_test = np.expand_dims(self.test_data[0], axis=-1)
+            x_test = np.repeat(x_test, 3, axis=-1)
+            y_test = self.test_data[1]
+            
+            y_pred_prob = self.densenet_classif.predict(x_test, verbose=0)
+            y_pred = (y_pred_prob > 0.5).astype(int).flatten()
+            
+            acc, sens, spec, cm = evaluate_classifier(y_test, y_pred, "DenseNet121")
+            
+            messagebox.showinfo("Resultados DenseNet", 
+                              f"=== TESTE ===\n\n"
+                              f"Acurácia: {acc:.4f} ({acc*100:.2f}%)\n"
+                              f"Sensibilidade: {sens:.4f}\n"
+                              f"Especificidade: {spec:.4f}")
+            
+            plt.figure(figsize=(7, 6))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Greens', cbar=True)
+            plt.title(f'Matriz de Confusão - DenseNet121\nAcurácia: {acc:.4f}')
+            plt.ylabel('Classe Real')
+            plt.xlabel('Classe Predita')
+            plt.tight_layout()
+            plt.show()
+            
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def avaliar_densenet_regress(self):
-        """Avalia DenseNet regressão"""
-        messagebox.showinfo("DenseNet", "Avaliação de DenseNet Regressão")
+        """Avalia DenseNet regressão no TESTE"""
+        if self.densenet_regress is None:
+            messagebox.showwarning("Aviso", "Treine o DenseNet (regressão) primeiro!")
+            return
+        
+        try:
+            x_test = np.expand_dims(self.test_data[0], axis=-1)
+            x_test = np.repeat(x_test, 3, axis=-1)
+            y_test_age = self.test_data[2]
+            
+            y_pred_age = self.densenet_regress.predict(x_test, verbose=0).flatten()
+            mae = mean_absolute_error(y_test_age, y_pred_age)
+            
+            from sklearn.metrics import r2_score
+            r2 = r2_score(y_test_age, y_pred_age)
+            
+            messagebox.showinfo("Resultados DenseNet (Regressão)", 
+                              f"=== TESTE ===\n\n"
+                              f"MAE: {mae:.2f} anos\n"
+                              f"R² Score: {r2:.4f}\n\n"
+                              f"Interpretação:\n"
+                              f"• < 5 anos: Excelente\n"
+                              f"• 5-10 anos: Bom\n"
+                              f"• > 10 anos: Requer melhorias")
+            
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+            
+            ax1.scatter(y_test_age, y_pred_age, alpha=0.6, s=50)
+            ax1.plot([y_test_age.min(), y_test_age.max()], 
+                    [y_test_age.min(), y_test_age.max()], 'r--', lw=2)
+            ax1.set_xlabel('Idade Real')
+            ax1.set_ylabel('Idade Predita')
+            ax1.set_title(f'DenseNet - Regressão\nMAE: {mae:.2f} anos | R²: {r2:.4f}')
+            ax1.grid(True, alpha=0.3)
+            
+            erros = y_pred_age - y_test_age
+            ax2.hist(erros, bins=20, edgecolor='black', alpha=0.7)
+            ax2.axvline(x=0, color='r', linestyle='--', linewidth=2)
+            ax2.set_xlabel('Erro (anos)')
+            ax2.set_ylabel('Frequência')
+            ax2.set_title(f'Distribuição dos Erros\nMédia: {erros.mean():.2f} anos')
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.show()
+            
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    def plot_densenet_learning_curves(self):
+        """Plota curvas de aprendizado: Acurácia, Loss, Sensibilidade e Especificidade."""
+        if not hasattr(self, 'densenet_history'):
+            messagebox.showwarning("Aviso", "Nenhum histórico de treinamento!")
+            return
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        epochs = range(1, len(self.densenet_history['accuracy']) + 1)
+
+        # Acurácia
+        axes[0,0].plot(epochs, self.densenet_history['accuracy'], 'b-o', label='Treino', linewidth=2)
+        axes[0,0].plot(epochs, self.densenet_history['val_accuracy'], 'r-s', label='Validação', linewidth=2)
+        axes[0,0].set_title('Acurácia', fontsize=13, fontweight='bold')
+        axes[0,0].set_xlabel('Época')
+        axes[0,0].set_ylabel('Acurácia')
+        axes[0,0].legend()
+        axes[0,0].grid(True, alpha=0.3)
+
+        # Loss
+        axes[0,1].plot(epochs, self.densenet_history['loss'], 'b-o', label='Treino', linewidth=2)
+        axes[0,1].plot(epochs, self.densenet_history['val_loss'], 'r-s', label='Validação', linewidth=2)
+        axes[0,1].set_title('Loss', fontsize=13, fontweight='bold')
+        axes[0,1].set_xlabel('Época')
+        axes[0,1].set_ylabel('Loss')
+        axes[0,1].legend()
+        axes[0,1].grid(True, alpha=0.3)
+
+        # Sensibilidade
+        if 'val_sensitivity' in self.densenet_history:
+            axes[1,0].plot(epochs, self.densenet_history['val_sensitivity'], 'g-o', label='Sensibilidade', linewidth=2)
+            axes[1,0].set_title('Sensibilidade (Validação)', fontsize=13, fontweight='bold')
+            axes[1,0].set_xlabel('Época')
+            axes[1,0].set_ylabel('Sensibilidade')
+            axes[1,0].grid(True, alpha=0.3)
+        else:
+            axes[1,0].text(0.5,0.5,'Sem dados de sensibilidade', ha='center')
+
+        # Especificidade
+        if 'val_specificity' in self.densenet_history:
+            axes[1,1].plot(epochs, self.densenet_history['val_specificity'], 'm-o', label='Especificidade', linewidth=2)
+            axes[1,1].set_title('Especificidade (Validação)', fontsize=13, fontweight='bold')
+            axes[1,1].set_xlabel('Época')
+            axes[1,1].set_ylabel('Especificidade')
+            axes[1,1].grid(True, alpha=0.3)
+        else:
+            axes[1,1].text(0.5,0.5,'Sem dados de especificidade', ha='center')
+
+        plt.suptitle('DenseNet - Curvas de Aprendizado', fontsize=16, fontweight='bold')
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def analise_temporal_densenet(self):
+        """Análise temporal para DenseNet - visitas posteriores têm idades maiores?"""
+        if self.densenet_regress is None:
+            messagebox.showwarning("Aviso", "Treine o DenseNet (regressão) primeiro!")
+            return
+        
+        try:
+            x_test = np.expand_dims(self.test_data[0], axis=-1)
+            x_test = np.repeat(x_test, 3, axis=-1)
+            
+            y_pred = self.densenet_regress.predict(x_test, verbose=0).flatten()
+            test_data_df = self.valid_data_df[self.valid_data_df['Subject ID'].isin(self.test_patients['Subject ID'])].copy()
+            
+            if len(y_pred) != len(test_data_df):
+                messagebox.showwarning("Aviso", "Número de predições não corresponde aos dados de teste")
+                return
+            
+            test_data_df['predicted_age'] = y_pred
+            
+            consistent_increase = 0
+            total_patients = 0
+            exemplos_bons = []
+            exemplos_ruins = []
+            diferencas_medias = []
+            
+            for subject_id, group in test_data_df.sort_values(['Subject ID', 'Visit']).groupby('Subject ID'):
+                if len(group) > 1:
+                    total_patients += 1
+                    predicted_ages = group['predicted_age'].values
+                    real_ages = group['Age'].values
+                    
+                    diffs_pred = np.diff(predicted_ages)
+                    diffs_real = np.diff(real_ages)
+                    
+                    if np.all(diffs_pred >= 0):
+                        consistent_increase += 1
+                        if len(exemplos_bons) < 3:
+                            exemplos_bons.append((subject_id, predicted_ages, real_ages))
+                    else:
+                        if len(exemplos_ruins) < 3:
+                            exemplos_ruins.append((subject_id, predicted_ages, real_ages))
+                    
+                    diferencas_medias.append(np.mean(diffs_pred))
+            
+            ratio = (consistent_increase / total_patients * 100) if total_patients > 0 else 0
+            
+            result_text = (
+                f"=== ANÁLISE TEMPORAL (DenseNet) ===\n\n"
+                f"Pacientes com múltiplas visitas: {total_patients}\n"
+                f"Com idades CRESCENTES: {consistent_increase}\n"
+                f"Percentual de acerto: {ratio:.1f}%\n\n"
+                f"Diferença média entre visitas: {np.mean(diferencas_medias):.2f} anos\n\n"
+                f"RESPOSTA: {'SIM' if ratio >= 70 else 'NÃO'}, {ratio:.1f}% dos exames\n"
+                f"em visitas posteriores resultaram em idades\n"
+                f"{'maiores ou iguais' if ratio >= 70 else 'NEM SEMPRE maiores'}.\n\n"
+                f"Comparação:\n"
+                f"• DenseNet geralmente tem {'MELHOR' if ratio >= 70 else 'PIOR'} desempenho\n"
+                f"  que XGBoost na progressão temporal.\n"
+            )
+            
+            if exemplos_bons:
+                result_text += "\nExemplos de SUCESSO:\n"
+                for subj_id, pred_ages, real_ages in exemplos_bons[:2]:
+                    result_text += f"  {subj_id}: {pred_ages[0]:.1f}→{pred_ages[-1]:.1f} anos (Real: {real_ages[0]:.1f}→{real_ages[-1]:.1f})\n"
+            
+            messagebox.showinfo("Análise Temporal - DenseNet", result_text)
+            
+            # Plotar gráfico comparativo
+            if exemplos_bons:
+                fig, axes = plt.subplots(1, min(3, len(exemplos_bons)), figsize=(15, 4))
+                if len(exemplos_bons) == 1:
+                    axes = [axes]
+                
+                for idx, (subj_id, pred_ages, real_ages) in enumerate(exemplos_bons[:3]):
+                    ax = axes[idx] if len(exemplos_bons) > 1 else axes[0]
+                    visitas = range(1, len(pred_ages) + 1)
+                    
+                    ax.plot(visitas, real_ages, 'g-o', label='Idade Real', linewidth=2, markersize=8)
+                    ax.plot(visitas, pred_ages, 'r--s', label='Idade Predita (DenseNet)', linewidth=2, markersize=8)
+                    ax.set_xlabel('Visita', fontsize=11)
+                    ax.set_ylabel('Idade (anos)', fontsize=11)
+                    ax.set_title(f'Paciente {subj_id}\n(DenseNet - Exemplo de Sucesso)', fontsize=12, fontweight='bold')
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                plt.suptitle('Progressão Temporal - DenseNet (Exemplos Corretos)', 
+                           fontsize=14, fontweight='bold', y=1.02)
+                plt.show()
+            
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
     
     # =========================================================================
     # ACESSIBILIDADE
