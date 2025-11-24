@@ -17,6 +17,7 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import SVC
 import xgboost as xgb
 from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, roc_auc_score, mean_absolute_error
+import cv2
 
 # --- 1. Data Loading Utility ---
 image_size = (128, 128)
@@ -31,6 +32,7 @@ def load_images(paths):
             if img_data.ndim == 2:
                 resized_img = resize(img_data, image_size, anti_aliasing=True)
                 data.append(resized_img)
+                
             else:
                 print(f"Skipping {path}: Not a 2D image.")
         else:
@@ -234,18 +236,51 @@ def plot_mri_image(mri_id):
     # OTHER CASES (rare)
     # -----------------------------
     raise ValueError(f"Unexpected MRI shape: {data.shape}")
+def identify_ventricles(x_train_img):
+    
+    #turns each pixel into a row wich can have one gray value
+    pixel_vals_train = x_train_img.reshape((-1,1))
+    plt.figure(figsize=(6, 6))
+    plt.imshow(x_train_img[0], cmap='gray')
+    plt.axis("off")
+    plt.show()
+   
+    pixel_vals_train = np.float32(pixel_vals_train)
+    
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.85)
+
+    k = 3
+    retval, labels, centers = cv2.kmeans(pixel_vals_train, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+
+    centers = np.uint8(centers)
+    segmented_data = centers[labels.flatten()]
+
+    segmented_image = segmented_data.reshape((pixel_vals_train.shape))
+
+    plt.imshow(segmented_image)
+
+
+
+
+    
+    
+    
+
+
 
 # --- Main Execution ---
 
 if __name__ == '__main__':
     plot_mri_image("OAS2_0001")
     # --- Data Loading ---
+    #works by each () being a return parameter of  load_and_prepare_data function
     (x_train_img, y_train_class, y_train_age), \
     (x_val_img, y_val_class, y_val_age), \
     (x_test_img, y_test_class, y_test_age), \
     valid_data_df, test_patients = load_and_prepare_data() # Added return values
-
+    identify_ventricles(x_train_img)
     print("\n--- TASK 1: CLASSIFICATION (Demented vs. NonDemented) ---")
+
     
     # --- Feature Extraction and Scaling for Shallow Models ---
     print("Extracting features for shallow classification models...")
@@ -365,3 +400,5 @@ if __name__ == '__main__':
     else:
         print("Not enough data with multiple visits in the test set to perform this analysis.")
     print("--------------------------")
+    print("identify_ventricle")
+   
