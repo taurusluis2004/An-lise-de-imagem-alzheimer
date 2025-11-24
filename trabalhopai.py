@@ -777,18 +777,34 @@ class AlzheimerAnalysisGUI:
                 colsample_bytree=0.8,
                 reg_alpha=0.1,
                 reg_lambda=1.0,
-                random_state=42
+                random_state=42,
+                eval_metric='mae'  # compatível com versões antigas (no params)
             )
             self.xgboost_model = xgb.XGBRegressor(**params)
-            self.xgboost_model.fit(
-                self.x_train_features,
-                self.train_data[2],
-                eval_set=[(self.x_val_features, self.val_data[2])],
-                eval_metric='mae',
-                early_stopping_rounds=30,
-                verbose=False
-            )
-            messagebox.showinfo("Sucesso", f"XGBoost treinado! Melhor iter: {self.xgboost_model.best_iteration}")
+            try:
+                # Tentativa com early stopping e eval_set (APIs mais novas)
+                self.xgboost_model.fit(
+                    self.x_train_features,
+                    self.train_data[2],
+                    eval_set=[(self.x_val_features, self.val_data[2])],
+                    early_stopping_rounds=30,
+                    verbose=False
+                )
+            except TypeError:
+                # Fallback para APIs antigas sem esses kwargs
+                self.xgboost_model.fit(self.x_train_features, self.train_data[2])
+            # Recupera melhor iteração de forma robusta (difere por versão do XGBoost)
+            best_iter = getattr(self.xgboost_model, 'best_iteration', None)
+            if best_iter is None:
+                try:
+                    best_iter = self.xgboost_model.get_booster().best_iteration
+                except Exception:
+                    best_iter = None
+            if best_iter is not None and isinstance(best_iter, (int, np.integer)) and best_iter >= 0:
+                message = f"XGBoost treinado! Melhor iteração: {int(best_iter)}"
+            else:
+                message = "XGBoost treinado!"
+            messagebox.showinfo("Sucesso", message)
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao treinar XGBoost:\n{str(e)}")
     
@@ -802,7 +818,8 @@ class AlzheimerAnalysisGUI:
             y_true = self.test_data[2]
             y_pred = self.xgboost_model.predict(self.x_test_features)
             mae = mean_absolute_error(y_true, y_pred)
-            rmse = mean_squared_error(y_true, y_pred, squared=False)
+            # Compatível com versões antigas do scikit-learn (sem parâmetro 'squared')
+            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
             r2 = r2_score(y_true, y_pred)
             abs_err = np.abs(y_true - y_pred)
             pct_within_5 = np.mean(abs_err <= 5) * 100
@@ -1007,7 +1024,7 @@ class AlzheimerAnalysisGUI:
             x_test_proc = self._prepare_images_densenet(x_test)
             preds = self.densenet_regress.predict(x_test_proc).ravel()
             mae = mean_absolute_error(y_test_age, preds)
-            rmse = mean_squared_error(y_test_age, preds, squared=False)
+            rmse = np.sqrt(mean_squared_error(y_test_age, preds))
             r2 = r2_score(y_test_age, preds)
             # Dispersão
             fig = Figure(figsize=(6,5), dpi=100)
