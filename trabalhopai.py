@@ -14,7 +14,7 @@ from matplotlib.figure import Figure
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import SVC
-from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, mean_absolute_error
+from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, mean_absolute_error, mean_squared_error, r2_score
 import xgboost as xgb
 import nibabel as nib
 from skimage.transform import resize
@@ -22,9 +22,10 @@ from skimage.feature import graycomatrix, graycoprops
 from PIL import Image
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from keras.models import Model
-from keras.layers import Input, Conv2D, Flatten, Dense, Dropout, BatchNormalization, MaxPooling2D
-from keras.applications import DenseNet121
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D
+from tensorflow.keras.applications import DenseNet121
+from tensorflow.keras.optimizers import Adam
 
 # =============================================================================
 # CLASSE IMAGE LOADER (integrado de image_loader.py)
@@ -272,6 +273,7 @@ class AlzheimerAnalysisGUI:
         self.xgboost_model = None
         self.densenet_classif = None
         self.densenet_regress = None
+        self.densenet_history = None
         
         # Dados
         self.train_data = None
@@ -336,6 +338,7 @@ class AlzheimerAnalysisGUI:
         menu_densenet.add_separator()
         menu_densenet.add_command(label="Avaliar Classificação", command=self.avaliar_densenet_classif)
         menu_densenet.add_command(label="Avaliar Regressão", command=self.avaliar_densenet_regress)
+        menu_densenet.add_command(label="Curvas Classificação", command=self.plot_curvas_densenet_classif)
         menu_bar.add_cascade(label="DenseNet", menu=menu_densenet)
         
         # Menu Acessibilidade
@@ -343,6 +346,12 @@ class AlzheimerAnalysisGUI:
         menu_acess.add_command(label="Aumentar Fonte", command=self.aumentar_fonte)
         menu_acess.add_command(label="Diminuir Fonte", command=self.diminuir_fonte)
         menu_bar.add_cascade(label="Acessibilidade", menu=menu_acess)
+
+        # Menu Segmentação
+        menu_seg = tk.Menu(menu_bar, tearoff=0)
+        menu_seg.add_command(label="Segmentar Ventrículos", command=self.segmentar_ventriculos)
+        menu_seg.add_command(label="Mostrar Todas Fatias", command=self.exibir_todas_fatias)
+        menu_bar.add_cascade(label="Segmentação", menu=menu_seg)
         
         self.root.config(menu=menu_bar)
         
@@ -397,18 +406,62 @@ class AlzheimerAnalysisGUI:
         self.lbl_zoom = ttk.Label(self.zoom_frame, text="Zoom: 100%")
         self.lbl_zoom.pack(pady=5)
         
-        # === PAINEL DIREITO ===
+        # === PAINEL DIREITO COM TABS ===
+        self.tabs = ttk.Notebook(self.painel_direito)
+        self.tab_imagem = ttk.Frame(self.tabs)
+        self.tab_graficos = ttk.Frame(self.tabs)
+        self.tabs.add(self.tab_imagem, text="Imagem")
+        self.tabs.add(self.tab_graficos, text="Gráficos")
+        self.tabs.pack(fill=tk.BOTH, expand=True)
+
+        # Figura principal (Imagem)
         self.fig = Figure(figsize=(8, 6), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_title("Visualizador de Imagens Médicas")
         self.ax.axis('off')
-        
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.painel_direito)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.tab_imagem)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        self.ax.text(0.5, 0.5, 'Carregue uma imagem\npelo menu Arquivo', 
-                    ha='center', va='center', fontsize=16, transform=self.ax.transAxes)
+        self.ax.text(0.5, 0.5, 'Carregue uma imagem\npelo menu Arquivo',
+                 ha='center', va='center', fontsize=16, transform=self.ax.transAxes)
+
+        # Figura gráficos
+        self.fig_plots = Figure(figsize=(8, 6), dpi=100)
+        self.ax_plots = self.fig_plots.add_subplot(111)
+        self.ax_plots.axis('off')
+        self.canvas_plots = FigureCanvasTkAgg(self.fig_plots, master=self.tab_graficos)
+        self.canvas_plots.draw()
+        self.canvas_plots.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.ax_plots.text(0.5, 0.5, 'Gráficos aparecerão aqui', ha='center', va='center', fontsize=14, transform=self.ax_plots.transAxes)
+
+    # =========================================================================
+    # UTILITÁRIOS DE FIGURA
+    # =========================================================================
+    def show_figure(self, fig, title="Figura"):
+        """Exibe figura matplotlib em janela separada Tkinter."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        btn = ttk.Button(win, text="Fechar", command=win.destroy)
+        btn.pack(pady=5)
+
+    def show_plot_main(self, fig):
+        """Renderiza figura na aba 'Gráficos'."""
+        # Limpa figura anterior
+        self.fig_plots.clf()
+        # Copia axes da figura recebida
+        # Estratégia: desenhar a figura recebida diretamente no canvas da aba usando Agg.
+        # Mais simples: substituir self.fig_plots por fig e recriar canvas.
+        self.fig_plots = fig
+        # Recria canvas
+        for child in self.tab_graficos.winfo_children():
+            child.destroy()
+        self.canvas_plots = FigureCanvasTkAgg(self.fig_plots, master=self.tab_graficos)
+        self.canvas_plots.draw()
+        self.canvas_plots.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.tabs.select(self.tab_graficos)
     
     # =========================================================================
     # FUNÇÕES DE CARREGAMENTO DE IMAGEM
@@ -618,12 +671,13 @@ class AlzheimerAnalysisGUI:
             y_pred = self.svm_model.predict(X_test_scaled)
             cm = confusion_matrix(self.test_data[1], y_pred)
             
-            plt.figure(figsize=(6, 5))
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-            plt.title('Matriz de Confusão - SVM')
-            plt.ylabel('Real')
-            plt.xlabel('Predito')
-            plt.show()
+            fig = Figure(figsize=(6,5), dpi=100)
+            ax = fig.add_subplot(111)
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax)
+            ax.set_title('Matriz de Confusão - SVM')
+            ax.set_ylabel('Real')
+            ax.set_xlabel('Predito')
+            self.show_plot_main(fig)
         except Exception as e:
             messagebox.showerror("Erro", f"Erro:\n{str(e)}")
     
@@ -690,31 +744,226 @@ class AlzheimerAnalysisGUI:
     # =========================================================================
     # DENSENET - MODELO PROFUNDO
     # =========================================================================
+    def _prepare_images_densenet(self, images):
+        """Converte lista de imagens (N,H,W) para (N,224,224,3) normalizadas."""
+        target = (224,224)
+        out = []
+        for img in images:
+            arr = img.astype(np.float32)
+            mn, mx = arr.min(), arr.max()
+            if mx > mn:
+                arr = (arr - mn)/(mx-mn)
+            else:
+                arr = np.zeros_like(arr, dtype=np.float32)
+            arr_res = resize(arr, target, anti_aliasing=True).astype(np.float32)
+            arr_rgb = np.stack([arr_res, arr_res, arr_res], axis=-1)
+            out.append(arr_rgb)
+        return np.array(out, dtype=np.float32)
+
     def treinar_densenet_classif(self):
-        """Treina DenseNet para classificação"""
+        """Treina DenseNet121 (ImageNet) para classificação binária."""
         if self.train_data is None:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
-        
-        messagebox.showinfo("DenseNet", "Treinamento de DenseNet para classificação\n"
-                          "será implementado aqui com fine-tuning.")
+        try:
+            x_train, y_train, _ = self.train_data
+            x_val, y_val, _ = self.val_data
+            messagebox.showinfo("DenseNet", "Preparando imagens para DenseNet...")
+            self.x_train_densenet = self._prepare_images_densenet(x_train)
+            self.x_val_densenet = self._prepare_images_densenet(x_val)
+            base = DenseNet121(weights='imagenet', include_top=False, input_shape=(224,224,3))
+            for layer in base.layers:
+                layer.trainable = False
+            x = base.output
+            x = GlobalAveragePooling2D()(x)
+            x = Dense(128, activation='relu')(x)
+            x = Dropout(0.3)(x)
+            out = Dense(1, activation='sigmoid')(x)
+            model = Model(inputs=base.input, outputs=out)
+            model.compile(optimizer=Adam(learning_rate=1e-3), loss='binary_crossentropy', metrics=['accuracy'])
+            messagebox.showinfo("DenseNet", "Treinando (5 épocas)...")
+            history = model.fit(self.x_train_densenet, y_train, validation_data=(self.x_val_densenet, y_val), epochs=5, batch_size=8, verbose=1)
+            self.densenet_classif = model
+            self.densenet_history = history
+            messagebox.showinfo("Sucesso", "DenseNet classificação treinada!")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha no treinamento DenseNet:\n{str(e)}")
     
     def treinar_densenet_regress(self):
-        """Treina DenseNet para regressão"""
+        """Treina DenseNet121 para regressão de idade."""
         if self.train_data is None:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
-        
-        messagebox.showinfo("DenseNet", "Treinamento de DenseNet para regressão\n"
-                          "será implementado aqui com fine-tuning.")
+        try:
+            x_train, _, y_train_age = self.train_data
+            x_val, _, y_val_age = self.val_data
+            messagebox.showinfo("DenseNet", "Preparando imagens para regressão...")
+            self.x_train_densenet_reg = self._prepare_images_densenet(x_train)
+            self.x_val_densenet_reg = self._prepare_images_densenet(x_val)
+            base = DenseNet121(weights='imagenet', include_top=False, input_shape=(224,224,3))
+            for layer in base.layers:
+                layer.trainable = False
+            x = base.output
+            x = GlobalAveragePooling2D()(x)
+            x = Dense(128, activation='relu')(x)
+            x = Dropout(0.3)(x)
+            out = Dense(1, activation='linear')(x)
+            model = Model(inputs=base.input, outputs=out)
+            model.compile(optimizer=Adam(learning_rate=1e-3), loss='mse', metrics=['mae'])
+            history = model.fit(self.x_train_densenet_reg, y_train_age, validation_data=(self.x_val_densenet_reg, y_val_age), epochs=5, batch_size=8, verbose=1)
+            self.densenet_regress = model
+            self.densenet_regress_history = history
+            # Curvas
+            fig = Figure(figsize=(8,5), dpi=100)
+            ax1 = fig.add_subplot(121)
+            ax2 = fig.add_subplot(122)
+            ax1.plot(history.history['mae'], label='Treino')
+            ax1.plot(history.history['val_mae'], label='Validação')
+            ax1.set_title('MAE')
+            ax1.set_xlabel('Época'); ax1.set_ylabel('MAE'); ax1.legend()
+            ax2.plot(history.history['loss'], label='Treino')
+            ax2.plot(history.history['val_loss'], label='Validação')
+            ax2.set_title('MSE')
+            ax2.set_xlabel('Época'); ax2.set_ylabel('MSE'); ax2.legend()
+            fig.tight_layout()
+            self.show_plot_main(fig)
+            messagebox.showinfo("Sucesso", "DenseNet regressão treinada!")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha no treinamento DenseNet Regressão:\n{str(e)}")
     
+    def plot_curvas_densenet_classif(self):
+        """Plota curvas (acurácia e loss) da DenseNet classificação."""
+        if self.densenet_history is None:
+            messagebox.showwarning("Aviso", "Treine a DenseNet primeiro!")
+            return
+        h = self.densenet_history.history
+        fig = Figure(figsize=(8,5), dpi=100)
+        ax1 = fig.add_subplot(121)
+        ax2 = fig.add_subplot(122)
+        ax1.plot(h['accuracy'], label='Treino')
+        ax1.plot(h['val_accuracy'], label='Validação')
+        ax1.set_title('Acurácia')
+        ax1.set_xlabel('Época')
+        ax1.set_ylabel('Acc')
+        ax1.legend()
+        ax2.plot(h['loss'], label='Treino')
+        ax2.plot(h['val_loss'], label='Validação')
+        ax2.set_title('Loss')
+        ax2.set_xlabel('Época')
+        ax2.set_ylabel('Loss')
+        ax2.legend()
+        fig.tight_layout()
+        self.show_figure(fig, title="Curvas DenseNet Classificação")
+
     def avaliar_densenet_classif(self):
-        """Avalia DenseNet classificação"""
-        messagebox.showinfo("DenseNet", "Avaliação de DenseNet Classificação")
+        """Avalia DenseNet classificação: métricas e matriz de confusão."""
+        if self.densenet_classif is None or self.test_data is None:
+            messagebox.showwarning("Aviso", "Treine DenseNet e prepare dados!")
+            return
+        try:
+            x_test, y_test, _ = self.test_data
+            x_test_proc = self._prepare_images_densenet(x_test)
+            probs = self.densenet_classif.predict(x_test_proc)
+            y_pred = (probs.ravel() >= 0.5).astype(int)
+            acc, sens, spec, cm = evaluate_classifier(y_test, y_pred, "DenseNet Classif")
+            fig = Figure(figsize=(6,5), dpi=100)
+            ax = fig.add_subplot(111)
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Purples', ax=ax)
+            ax.set_title('Matriz de Confusão - DenseNet')
+            ax.set_ylabel('Real')
+            ax.set_xlabel('Predito')
+            self.show_figure(fig, title="Matriz DenseNet Classificação")
+            messagebox.showinfo("Resultados DenseNet", f"Acurácia: {acc:.4f}\nSensibilidade: {sens:.4f}\nEspecificidade: {spec:.4f}")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha na avaliação DenseNet:\n{str(e)}")
     
     def avaliar_densenet_regress(self):
-        """Avalia DenseNet regressão"""
-        messagebox.showinfo("DenseNet", "Avaliação de DenseNet Regressão")
+        """Avalia DenseNet regressão no teste."""
+        if self.densenet_regress is None or self.test_data is None:
+            messagebox.showwarning("Aviso", "Treine a DenseNet regressão e prepare dados!")
+            return
+        try:
+            x_test, _, y_test_age = self.test_data
+            x_test_proc = self._prepare_images_densenet(x_test)
+            preds = self.densenet_regress.predict(x_test_proc).ravel()
+            mae = mean_absolute_error(y_test_age, preds)
+            rmse = mean_squared_error(y_test_age, preds, squared=False)
+            r2 = r2_score(y_test_age, preds)
+            # Dispersão
+            fig = Figure(figsize=(6,5), dpi=100)
+            ax = fig.add_subplot(111)
+            ax.scatter(y_test_age, preds, alpha=0.7)
+            ax.plot([y_test_age.min(), y_test_age.max()], [y_test_age.min(), y_test_age.max()], 'r--')
+            ax.set_title('Idade Real vs Predita (DenseNet)')
+            ax.set_xlabel('Real'); ax.set_ylabel('Predita')
+            self.show_plot_main(fig)
+            messagebox.showinfo("DenseNet Regressão", f"MAE: {mae:.2f}\nRMSE: {rmse:.2f}\nR2: {r2:.3f}")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha na avaliação DenseNet Regressão:\n{str(e)}")
+
+    # =========================================================================
+    # SEGMENTAÇÃO VENTRÍCULOS (K-Means simples)
+    # =========================================================================
+    def segmentar_ventriculos(self):
+        """Segmenta ventrículos na fatia atual usando K-means (k=2) heurístico."""
+        if self.current_image_data is None:
+            messagebox.showwarning("Aviso", "Carregue uma imagem primeiro!")
+            return
+        try:
+            # Usa fatia atual
+            if len(self.current_image_data.shape) == 3:
+                slice_data = ImageLoader.get_slice(self.current_image_data, self.current_axis, self.current_slice_index)
+            else:
+                slice_data = self.current_image_data
+            import cv2
+            img = slice_data.astype(np.float32)
+            # Normaliza
+            mn, mx = img.min(), img.max()
+            if mx > mn:
+                img_n = (img - mn)/(mx-mn)
+            else:
+                img_n = np.zeros_like(img)
+            img_blur = cv2.GaussianBlur(img_n, (5,5), 1)
+            pixels = img_blur.reshape((-1,1)).astype(np.float32)
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.85)
+            _, labels, centers = cv2.kmeans(pixels, 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+            centers = centers.ravel()
+            # Assume ventrículos = cluster mais claro
+            ventr_cluster = np.argmax(centers)
+            mask = (labels.reshape(img_blur.shape) == ventr_cluster)
+            # Limpa máscara
+            mask = cv2.medianBlur(mask.astype(np.uint8), 5)
+            # Figura
+            fig = Figure(figsize=(8,4), dpi=100)
+            ax1 = fig.add_subplot(121)
+            ax2 = fig.add_subplot(122)
+            ax1.imshow(img_n, cmap='gray'); ax1.set_title('Fatia Original'); ax1.axis('off')
+            overlay = np.dstack([np.zeros_like(img_n), np.zeros_like(img_n), np.zeros_like(img_n)])
+            overlay[mask] = [1,0,0]
+            ax2.imshow(img_n, cmap='gray')
+            ax2.imshow(overlay, alpha=0.4)
+            ax2.set_title('Ventrículos (Heurístico)'); ax2.axis('off')
+            fig.tight_layout()
+            self.show_plot_main(fig)
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha na segmentação:\n{str(e)}")
+
+    def exibir_todas_fatias(self):
+        """Exibe grid com todas as fatias (se 3D)."""
+        if self.current_image_data is None or len(self.current_image_data.shape) != 3:
+            messagebox.showwarning("Aviso", "Imagem 3D não carregada.")
+            return
+        data = self.current_image_data
+        num_slices = data.shape[2]
+        cols = 8
+        rows = int(np.ceil(num_slices/cols))
+        fig = Figure(figsize=(15, rows*2), dpi=100)
+        for i in range(num_slices):
+            ax = fig.add_subplot(rows, cols, i+1)
+            ax.imshow(ImageLoader.normalize_for_display(data[:,:,i]), cmap='gray')
+            ax.axis('off')
+        fig.tight_layout()
+        self.show_plot_main(fig)
     
     # =========================================================================
     # ACESSIBILIDADE
