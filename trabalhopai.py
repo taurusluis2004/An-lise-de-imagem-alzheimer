@@ -26,6 +26,25 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D
 from tensorflow.keras.applications import DenseNet121
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import Callback
+
+# =============================================================================
+# CALLBACK CUSTOMIZADO PARA TESTE
+# =============================================================================
+class TestAccuracyCallback(Callback):
+    """Callback para registrar acurácia de teste ao fim de cada época."""
+    def __init__(self, x_test, y_test):
+        super().__init__()
+        self.x_test = x_test
+        self.y_test = y_test
+        self.test_acc = []
+
+    def on_epoch_end(self, epoch, logs=None):
+        loss, acc = self.model.evaluate(self.x_test, self.y_test, verbose=0)
+        if logs is not None:
+            logs['test_accuracy'] = acc
+        self.test_acc.append(acc)
+        print(f"Época {epoch+1} - Test Accuracy: {acc:.4f}")
 
 # =============================================================================
 # CLASSE IMAGE LOADER (integrado de image_loader.py)
@@ -898,19 +917,23 @@ class AlzheimerAnalysisGUI:
         return np.array(out, dtype=np.float32)
 
     def treinar_densenet_classif(self):
-        """Treina DenseNet121 (ImageNet) para classificação binária."""
+        """Treina DenseNet121 (ImageNet) para classificação binária com fine-tuning."""
         if self.train_data is None:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
         try:
             x_train, y_train, _ = self.train_data
             x_val, y_val, _ = self.val_data
+            x_test, y_test, _ = self.test_data
             messagebox.showinfo("DenseNet", "Preparando imagens para DenseNet...")
             self.x_train_densenet = self._prepare_images_densenet(x_train)
             self.x_val_densenet = self._prepare_images_densenet(x_val)
+            self.x_test_densenet = self._prepare_images_densenet(x_test)
+
             base = DenseNet121(weights='imagenet', include_top=False, input_shape=(224,224,3))
             for layer in base.layers:
-                layer.trainable = False
+                layer.trainable = False  # fase 1 congelada
+
             x = base.output
             x = GlobalAveragePooling2D()(x)
             x = Dense(128, activation='relu')(x)
@@ -918,11 +941,62 @@ class AlzheimerAnalysisGUI:
             out = Dense(1, activation='sigmoid')(x)
             model = Model(inputs=base.input, outputs=out)
             model.compile(optimizer=Adam(learning_rate=1e-3), loss='binary_crossentropy', metrics=['accuracy'])
-            messagebox.showinfo("DenseNet", "Treinando (5 épocas)...")
-            history = model.fit(self.x_train_densenet, y_train, validation_data=(self.x_val_densenet, y_val), epochs=5, batch_size=8, verbose=1)
+
+            cb_test = TestAccuracyCallback(self.x_test_densenet, y_test)
+            messagebox.showinfo("DenseNet", "Treinando fase 1 (camadas congeladas, 5 épocas)...")
+            history_phase1 = model.fit(
+                self.x_train_densenet, y_train,
+                validation_data=(self.x_val_densenet, y_val),
+                epochs=5, batch_size=8, verbose=1,
+                callbacks=[cb_test]
+            )
+
+            # Fine-tuning: descongela últimas N camadas
+            ft_layers = 50
+            for layer in base.layers[-ft_layers:]:
+                layer.trainable = True
+            model.compile(optimizer=Adam(learning_rate=1e-4), loss='binary_crossentropy', metrics=['accuracy'])
+            messagebox.showinfo("DenseNet", f"Fine-tuning (últimas {ft_layers} camadas, 3 épocas)...")
+            history_phase2 = model.fit(
+                self.x_train_densenet, y_train,
+                validation_data=(self.x_val_densenet, y_val),
+                epochs=3, batch_size=8, verbose=1,
+                callbacks=[cb_test]
+            )
+
+            # Mescla históricos
+            merged_history = {}
+            for k in history_phase1.history.keys():
+                merged_history[k] = history_phase1.history[k] + history_phase2.history.get(k, [])
+            # Adiciona test_accuracy do callback
+            merged_history['test_accuracy'] = cb_test.test_acc
+
+            # Armazena
             self.densenet_classif = model
-            self.densenet_history = history
-            messagebox.showinfo("Sucesso", "DenseNet classificação treinada!")
+            class SimpleHistory:
+                def __init__(self, hist):
+                    self.history = hist
+            self.densenet_history = SimpleHistory(merged_history)
+
+            # Plot curva com teste
+            fig = Figure(figsize=(10,5), dpi=100)
+            ax1 = fig.add_subplot(121)
+            ax2 = fig.add_subplot(122)
+            ax1.plot(merged_history['accuracy'], label='Treino')
+            ax1.plot(merged_history['val_accuracy'], label='Validação')
+            ax1.plot(merged_history['test_accuracy'], label='Teste', linestyle='--')
+            ax1.set_title('Acurácia por Época')
+            ax1.set_xlabel('Época'); ax1.set_ylabel('Accuracy')
+            ax1.legend()
+            ax2.plot(merged_history['loss'], label='Treino')
+            ax2.plot(merged_history['val_loss'], label='Validação')
+            ax2.set_title('Loss por Época')
+            ax2.set_xlabel('Época'); ax2.set_ylabel('Loss')
+            ax2.legend()
+            fig.tight_layout()
+            self.show_plot_main(fig)
+
+            messagebox.showinfo("Sucesso", "DenseNet classificação (fine-tuning) treinada!")
         except Exception as e:
             messagebox.showerror("Erro", f"Falha no treinamento DenseNet:\n{str(e)}")
     
@@ -969,23 +1043,25 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Falha no treinamento DenseNet Regressão:\n{str(e)}")
     
     def plot_curvas_densenet_classif(self):
-        """Plota curvas (acurácia e loss) da DenseNet classificação."""
+        """Plota curvas (acurácia e loss) da DenseNet classificação com teste."""
         if self.densenet_history is None:
             messagebox.showwarning("Aviso", "Treine a DenseNet primeiro!")
             return
         h = self.densenet_history.history
-        fig = Figure(figsize=(8,5), dpi=100)
+        fig = Figure(figsize=(10,5), dpi=100)
         ax1 = fig.add_subplot(121)
         ax2 = fig.add_subplot(122)
         ax1.plot(h['accuracy'], label='Treino')
         ax1.plot(h['val_accuracy'], label='Validação')
-        ax1.set_title('Acurácia')
+        if 'test_accuracy' in h:
+            ax1.plot(h['test_accuracy'], label='Teste', linestyle='--')
+        ax1.set_title('Acurácia por Época')
         ax1.set_xlabel('Época')
-        ax1.set_ylabel('Acc')
+        ax1.set_ylabel('Accuracy')
         ax1.legend()
         ax2.plot(h['loss'], label='Treino')
         ax2.plot(h['val_loss'], label='Validação')
-        ax2.set_title('Loss')
+        ax2.set_title('Loss por Época')
         ax2.set_xlabel('Época')
         ax2.set_ylabel('Loss')
         ax2.legend()
