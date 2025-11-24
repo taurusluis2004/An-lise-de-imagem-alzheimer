@@ -225,6 +225,17 @@ def load_and_prepare_data():
     x_val_img = load_images(val_paths)
     x_test_img = load_images(test_paths)
 
+    # Carrega planilha.csv para features morfológicas (regressão)
+    planilha_path = os.path.join(base_dir, 'planilha.csv')
+    planilha_df = None
+    if os.path.exists(planilha_path):
+        planilha_df = pd.read_csv(planilha_path)
+        # Normaliza colunas numéricas que podem ter vírgula
+        for col in ['nWBV', 'area', 'perimeter', 'circularity', 'eccentricity', 'solidity', 'extent', 'mean_intensity']:
+            if col in planilha_df.columns:
+                planilha_df[col] = planilha_df[col].astype(str).str.replace(',', '.', regex=False)
+                planilha_df[col] = pd.to_numeric(planilha_df[col], errors='coerce')
+
     split_info = {
         'train_patients': train_patients,
         'val_patients': val_patients,
@@ -232,6 +243,7 @@ def load_and_prepare_data():
         'train_df': train_df,
         'val_df': val_df,
         'test_df': test_df,
+        'planilha_df': planilha_df,
         'label_encoder': le,
         'num_train_exams': len(train_paths),
         'num_val_exams': len(val_paths),
@@ -268,6 +280,31 @@ def extract_features(images):
             vec.append(np.mean(q)); vec.append(np.std(q))
         features.append(vec)
     return np.array(features, dtype=np.float32)
+
+def extract_morphological_features(planilha_df, mri_ids):
+    """Extrai features morfológicas da planilha.csv (area, perimeter, circularity, eccentricity, solidity, extent, mean_intensity)."""
+    if planilha_df is None:
+        # Retorna features vazias se planilha não disponível
+        return np.zeros((len(mri_ids), 7), dtype=np.float32)
+    
+    morphological = []
+    for mri in mri_ids:
+        row = planilha_df[planilha_df['MRI ID'] == mri]
+        if len(row) == 0:
+            # Valores padrão se não encontrar
+            morphological.append([1000.0, 300.0, 0.15, 0.7, 0.6, 0.4, 45.0])
+            continue
+        r = row.iloc[0]
+        morphological.append([
+            float(r.get('area', 1000.0)) if not pd.isna(r.get('area')) else 1000.0,
+            float(r.get('perimeter', 300.0)) if not pd.isna(r.get('perimeter')) else 300.0,
+            float(r.get('circularity', 0.15)) if not pd.isna(r.get('circularity')) else 0.15,
+            float(r.get('eccentricity', 0.7)) if not pd.isna(r.get('eccentricity')) else 0.7,
+            float(r.get('solidity', 0.6)) if not pd.isna(r.get('solidity')) else 0.6,
+            float(r.get('extent', 0.4)) if not pd.isna(r.get('extent')) else 0.4,
+            float(r.get('mean_intensity', 45.0)) if not pd.isna(r.get('mean_intensity')) else 45.0
+        ])
+    return np.array(morphological, dtype=np.float32)
 
 def extract_clinical_features(data_df, mri_ids):
     """Extrai features clínicas (EDUC, MMSE, eTIV, nWBV, ASF, Visit, Years_since_first, CDR)."""
@@ -400,7 +437,9 @@ class AlzheimerAnalysisGUI:
         # Menu Dados
         menu_dados = tk.Menu(menu_bar, tearoff=0)
         menu_dados.add_command(label="Preparar Dados (80/20)", command=self.preparar_dados)
-        menu_dados.add_command(label="Extrair Características", command=self.extrair_caracteristicas)
+        menu_dados.add_separator()
+        menu_dados.add_command(label="Extrair Características (Classificação)", command=self.extrair_caracteristicas)
+        menu_dados.add_command(label="Extrair Características (Regressão)", command=self.extrair_caracteristicas_regressao)
         menu_bar.add_cascade(label="Dados", menu=menu_dados)
         
         # Menu SVM
@@ -699,13 +738,13 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Erro ao preparar dados:\n{str(e)}")
     
     def extrair_caracteristicas(self):
-        """Extrai características GLCM das imagens"""
+        """Extrai características GLCM + clínicas para CLASSIFICAÇÃO (SVM e DenseNet classif)"""
         if self.train_data is None:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
         
         try:
-            messagebox.showinfo("Extraindo", "Extraindo características...\nIsso pode levar alguns minutos.")
+            messagebox.showinfo("Extraindo", "Extraindo características para CLASSIFICAÇÃO...\nIsso pode levar alguns minutos.")
             # Textura
             tex_train = extract_features(self.train_data[0])
             tex_val = extract_features(self.val_data[0])
@@ -717,13 +756,56 @@ class AlzheimerAnalysisGUI:
             clin_train = extract_clinical_features(self.valid_data_df, train_mri_ids)
             clin_val = extract_clinical_features(self.valid_data_df, val_mri_ids)
             clin_test = extract_clinical_features(self.valid_data_df, test_mri_ids)
-            # Concatena (textura + clínica)
+            # Concatena (textura + clínica) - SEM morfológicas para classificação
             self.x_train_features = np.concatenate([tex_train, clin_train], axis=1)
             self.x_val_features = np.concatenate([tex_val, clin_val], axis=1)
             self.x_test_features = np.concatenate([tex_test, clin_test], axis=1)
-            messagebox.showinfo("Sucesso", f"Características extraídas!\nDimensão final: {self.x_train_features.shape[1]}")
+            messagebox.showinfo("Sucesso", f"Características de CLASSIFICAÇÃO extraídas!\nDimensão: {self.x_train_features.shape[1]} (textura+clínicas)")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao extrair características:\n{str(e)}")
+    
+    def extrair_caracteristicas_regressao(self):
+        """Extrai características morfológicas (planilha.csv) + textura + clínicas para REGRESSÃO (XGBoost)"""
+        if self.train_data is None:
+            messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
+            return
+        
+        try:
+            messagebox.showinfo("Extraindo", "Extraindo características para REGRESSÃO...\nIsso pode levar alguns minutos.")
+            # Textura
+            tex_train = extract_features(self.train_data[0])
+            tex_val = extract_features(self.val_data[0])
+            tex_test = extract_features(self.test_data[0])
+            
+            # MRI IDs
+            train_mri_ids = self.split_info['train_df']['MRI ID'].tolist()
+            val_mri_ids = self.split_info['val_df']['MRI ID'].tolist()
+            test_mri_ids = self.split_info['test_df']['MRI ID'].tolist()
+            
+            # Morfológicas da planilha.csv
+            planilha_df = self.split_info.get('planilha_df')
+            morph_train = extract_morphological_features(planilha_df, train_mri_ids)
+            morph_val = extract_morphological_features(planilha_df, val_mri_ids)
+            morph_test = extract_morphological_features(planilha_df, test_mri_ids)
+            
+            # Clínicas
+            clin_train = extract_clinical_features(self.valid_data_df, train_mri_ids)
+            clin_val = extract_clinical_features(self.valid_data_df, val_mri_ids)
+            clin_test = extract_clinical_features(self.valid_data_df, test_mri_ids)
+            
+            # Concatena (morfológicas + textura + clínicas) para regressão
+            self.x_train_features_reg = np.concatenate([morph_train, tex_train, clin_train], axis=1)
+            self.x_val_features_reg = np.concatenate([morph_val, tex_val, clin_val], axis=1)
+            self.x_test_features_reg = np.concatenate([morph_test, tex_test, clin_test], axis=1)
+            
+            messagebox.showinfo("Sucesso", 
+                f"Características de REGRESSÃO extraídas!\n"
+                f"Dimensão: {self.x_train_features_reg.shape[1]} features\n"
+                f"  - Morfológicas (planilha.csv): 7\n"
+                f"  - Textura (GLCM): {tex_train.shape[1]}\n"
+                f"  - Clínicas (OASIS): {clin_train.shape[1]}")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao extrair características de regressão:\n{str(e)}")
     
     # =========================================================================
     # SVM - CLASSIFICADOR RASO
@@ -788,13 +870,13 @@ class AlzheimerAnalysisGUI:
     # XGBOOST - REGRESSOR RASO
     # =========================================================================
     def treinar_xgboost(self):
-        """Treina XGBoost para regressão de idade"""
-        if self.x_train_features is None:
-            messagebox.showwarning("Aviso", "Extraia as características primeiro!")
+        """Treina XGBoost para regressão de idade usando features da planilha.csv"""
+        if not hasattr(self, 'x_train_features_reg') or self.x_train_features_reg is None:
+            messagebox.showwarning("Aviso", "Extraia as características de REGRESSÃO primeiro!\n(Use 'Extrair Características (Regressão)')")
             return
         
         try:
-            messagebox.showinfo("Treinando", "Treinando XGBoost...")
+            messagebox.showinfo("Treinando", "Treinando XGBoost com features morfológicas da planilha.csv...")
             params = dict(
                 n_estimators=400,
                 max_depth=6,
@@ -810,15 +892,15 @@ class AlzheimerAnalysisGUI:
             try:
                 # Tentativa com early stopping e eval_set (APIs mais novas)
                 self.xgboost_model.fit(
-                    self.x_train_features,
+                    self.x_train_features_reg,
                     self.train_data[2],
-                    eval_set=[(self.x_val_features, self.val_data[2])],
+                    eval_set=[(self.x_val_features_reg, self.val_data[2])],
                     early_stopping_rounds=30,
                     verbose=False
                 )
             except TypeError:
                 # Fallback para APIs antigas sem esses kwargs
-                self.xgboost_model.fit(self.x_train_features, self.train_data[2])
+                self.xgboost_model.fit(self.x_train_features_reg, self.train_data[2])
             # Recupera melhor iteração de forma robusta (difere por versão do XGBoost)
             best_iter = getattr(self.xgboost_model, 'best_iteration', None)
             if best_iter is None:
@@ -842,7 +924,7 @@ class AlzheimerAnalysisGUI:
         
         try:
             y_true = self.test_data[2]
-            y_pred = self.xgboost_model.predict(self.x_test_features)
+            y_pred = self.xgboost_model.predict(self.x_test_features_reg)
             mae = mean_absolute_error(y_true, y_pred)
             # Compatível com versões antigas do scikit-learn (sem parâmetro 'squared')
             rmse = np.sqrt(mean_squared_error(y_true, y_pred))
@@ -875,7 +957,7 @@ class AlzheimerAnalysisGUI:
             return
         
         try:
-            y_pred = self.xgboost_model.predict(self.x_test_features)
+            y_pred = self.xgboost_model.predict(self.x_test_features_reg)
             # DataFrame de teste completo
             test_df = self.split_info['test_df'].copy()
             test_df = test_df.sort_values(['Subject ID','Visit'])
