@@ -1,25 +1,135 @@
-# trabalhopai.py
+# trabalhopai.py - VERSÃO COMPLETA COM INTERFACE GRÁFICA
+# Sistema de Análise de Imagens - Alzheimer
 
-# --- Import libraries ---
+# =============================================================================
+# IMPORTS
+# =============================================================================
 import numpy as np 
 import os
 import pandas as pd 
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 from sklearn.model_selection import train_test_split
-from keras.models import Model
-from keras.layers import Input, Conv2D, Flatten, Dense, Dropout, BatchNormalization, MaxPooling2D
-from keras.applications import DenseNet121
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.svm import SVC
+from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, mean_absolute_error
+import xgboost as xgb
 import nibabel as nib
 from skimage.transform import resize
 from skimage.feature import graycomatrix, graycoprops
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.svm import SVC
-import xgboost as xgb
-from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, roc_auc_score, mean_absolute_error
-import cv2
+from PIL import Image
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from keras.models import Model
+from keras.layers import Input, Conv2D, Flatten, Dense, Dropout, BatchNormalization, MaxPooling2D
+from keras.applications import DenseNet121
 
-# --- 1. Data Loading Utility ---
+# =============================================================================
+# CLASSE IMAGE LOADER (integrado de image_loader.py)
+# =============================================================================
+class ImageLoader:
+    """Classe para carregar imagens médicas em diferentes formatos."""
+    
+    @staticmethod
+    def load_image(file_path):
+        """
+        Carrega uma imagem de qualquer formato suportado.
+        
+        Args:
+            file_path (str): Caminho para o arquivo de imagem
+            
+        Returns:
+            tuple: (image_data, metadata)
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Arquivo não encontrado: {file_path}")
+        
+        ext = os.path.splitext(file_path.lower())[1]
+        
+        if file_path.lower().endswith('.nii.gz'):
+            return ImageLoader._load_nifti(file_path)
+        elif ext in ['.nii']:
+            return ImageLoader._load_nifti(file_path)
+        elif ext in ['.png', '.jpg', '.jpeg']:
+            return ImageLoader._load_2d_image(file_path)
+        else:
+            raise ValueError(f"Formato de arquivo não suportado: {ext}")
+    
+    @staticmethod
+    def _load_nifti(file_path):
+        """Carrega imagem Nifti (3D ou 4D)."""
+        img = nib.load(file_path)
+        data = img.get_fdata()
+        
+        metadata = {
+            'format': 'nifti',
+            'shape': data.shape,
+            'dimensions': len(data.shape),
+            'affine': img.affine,
+            'header': img.header,
+            'voxel_sizes': img.header.get_zooms(),
+            'file_path': file_path
+        }
+        
+        return data, metadata
+    
+    @staticmethod
+    def _load_2d_image(file_path):
+        """Carrega imagem 2D (PNG, JPG)."""
+        img = Image.open(file_path)
+        data = np.array(img)
+        
+        metadata = {
+            'format': 'image2d',
+            'shape': data.shape,
+            'dimensions': len(data.shape),
+            'mode': img.mode,
+            'size': img.size,
+            'file_path': file_path
+        }
+        
+        return data, metadata
+    
+    @staticmethod
+    def get_slice(image_data, axis=2, slice_idx=None):
+        """Extrai uma fatia 2D de uma imagem 3D."""
+        if len(image_data.shape) == 2:
+            return image_data
+        
+        if len(image_data.shape) == 3:
+            if slice_idx is None:
+                slice_idx = image_data.shape[axis] // 2
+            
+            if axis == 0:
+                return image_data[slice_idx, :, :]
+            elif axis == 1:
+                return image_data[:, slice_idx, :]
+            elif axis == 2:
+                return image_data[:, :, slice_idx]
+        
+        raise ValueError(f"Não é possível extrair fatia de imagem com shape {image_data.shape}")
+    
+    @staticmethod
+    def normalize_for_display(image_data):
+        """Normaliza dados da imagem para exibição (0-255)."""
+        data = image_data.copy()
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        data_min = data.min()
+        data_max = data.max()
+        
+        if data_max > data_min:
+            data = ((data - data_min) / (data_max - data_min) * 255).astype(np.uint8)
+        else:
+            data = np.zeros_like(data, dtype=np.uint8)
+        
+        return data
+
+# =============================================================================
+# FUNÇÕES DE PROCESSAMENTO DE DADOS
+# =============================================================================
 image_size = (128, 128)
 
 def load_images(paths):
@@ -32,33 +142,21 @@ def load_images(paths):
             if img_data.ndim == 2:
                 resized_img = resize(img_data, image_size, anti_aliasing=True)
                 data.append(resized_img)
-                
             else:
                 print(f"Skipping {path}: Not a 2D image.")
         else:
             print(f"Skipping {path}: File not found.")
     return np.array(data)
 
-# --- 2. Data Preparation ---
-
 def load_and_prepare_data():
-    """
-    Loads and preprocesses the dataset, splitting it into patient-aware
-    training, validation, and test sets for both images and labels.
-    Returns:
-        (x_train_img, y_train_class, y_train_age), 
-        (x_val_img, y_val_class, y_val_age), 
-        (x_test_img, y_test_class, y_test_age),
-        valid_data_df, # Added return
-        test_patients # Added return
-    """
-    # Read and clean the demographic data
-    demographics_df = pd.read_csv('oasis_longitudinal_demographic.csv', sep=';')
+    """Loads and preprocesses the dataset."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(base_dir, 'oasis_longitudinal_demographic.csv')
+    demographics_df = pd.read_csv(csv_path, sep=';')
     demographics_df['CDR'] = demographics_df['CDR'].astype(str).str.replace(',', '.', regex=False)
     demographics_df['CDR'] = pd.to_numeric(demographics_df['CDR'], errors='coerce')
     demographics_df['Age'] = pd.to_numeric(demographics_df['Age'], errors='coerce')
 
-    # --- Binary Diagnosis for Classification ---
     def get_diagnosis_binary(row):
         if row['Group'] == 'Nondemented':
             return 'NonDemented'
@@ -69,11 +167,8 @@ def load_and_prepare_data():
         return 'Unknown'
 
     demographics_df['Diagnosis'] = demographics_df.apply(get_diagnosis_binary, axis=1)
-    
-    # Filter out unknown diagnoses and missing data
     valid_data_df = demographics_df[demographics_df['Diagnosis'] != 'Unknown'].dropna(subset=['MRI ID', 'Subject ID', 'Age'])
 
-    # --- Patient-Based Stratified Split ---
     patient_info = valid_data_df.groupby('Subject ID').agg(
         final_CDR=('CDR', 'max'),
         first_visit_age=('Age', 'min')
@@ -84,24 +179,19 @@ def load_and_prepare_data():
     le = LabelEncoder()
     patient_info['Diagnosis_encoded'] = le.fit_transform(patient_info['Diagnosis'])
     
-    # Split patients
     train_val_patients, test_patients = train_test_split(
-        patient_info,
-        test_size=0.2,
-        random_state=42,
+        patient_info, test_size=0.2, random_state=42,
         stratify=patient_info['Diagnosis_encoded']
     )
     train_patients, val_patients = train_test_split(
-        train_val_patients,
-        test_size=0.2, # 20% of the 80% train_val set
-        random_state=42,
+        train_val_patients, test_size=0.2, random_state=42,
         stratify=train_val_patients['Diagnosis_encoded']
     )
 
-    # --- Get Image Paths and Labels for each set ---
     def get_set_data(patient_ids_df, full_df):
         set_df = full_df[full_df['Subject ID'].isin(patient_ids_df['Subject ID'])]
-        paths = [os.path.join('axl', f"{mri_id}_axl.nii") for mri_id in set_df['MRI ID']]
+        axl_dir = os.path.join(base_dir, 'axl')
+        paths = [os.path.join(axl_dir, f"{mri_id}_axl.nii") for mri_id in set_df['MRI ID']]
         class_labels = le.transform(set_df['Diagnosis'])
         age_labels = set_df['Age'].values
         return paths, class_labels, age_labels
@@ -115,10 +205,10 @@ def load_and_prepare_data():
     x_val_img = load_images(val_paths)
     x_test_img = load_images(test_paths)
     
-    return (x_train_img, y_train_class, y_train_age), (x_val_img, y_val_class, y_val_age), (x_test_img, y_test_class, y_test_age), valid_data_df, test_patients
-
-
-# --- 3. Feature Extraction ---
+    return (x_train_img, y_train_class, y_train_age), \
+           (x_val_img, y_val_class, y_val_age), \
+           (x_test_img, y_test_class, y_test_age), \
+           valid_data_df, test_patients
 
 def extract_features(images):
     """Extracts texture features from a list of images."""
@@ -130,16 +220,13 @@ def extract_features(images):
         features.append(props)
     return np.array(features)
 
-
-# --- 4. Evaluation Utilities ---
-
 def evaluate_classifier(y_true, y_pred, model_name):
     """Calculates and prints classification metrics."""
     cm = confusion_matrix(y_true, y_pred)
     tn, fp, fn, tp = cm.ravel() if cm.shape == (2, 2) else (0, 0, 0, 0)
     
     accuracy = accuracy_score(y_true, y_pred)
-    sensitivity = recall_score(y_true, y_pred) # Recall is sensitivity
+    sensitivity = recall_score(y_true, y_pred)
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
     
     print(f"--- {model_name} Evaluation ---")
@@ -147,9 +234,8 @@ def evaluate_classifier(y_true, y_pred, model_name):
     print(f"Sensitivity (Recall): {sensitivity:.4f}")
     print(f"Specificity: {specificity:.4f}")
     print("Confusion Matrix:")
-    sns.heatmap(cm, annot=True, fmt='d').set(title=f'{model_name} Confusion Matrix')
-    plt.show()
-    print("----------------------------------\n")
+    print(cm)
+    return accuracy, sensitivity, specificity, cm
 
 def plot_learning_curves(history, model_name):
     """Plots accuracy learning curves."""
@@ -162,298 +248,505 @@ def plot_learning_curves(history, model_name):
     plt.legend(loc='lower right')
     plt.show()
 
-def plot_mri_image(mri_id):
-    """
-    Loads and plots all slices from a .nii or .nii.gz MRI file.
+# =============================================================================
+# INTERFACE GRÁFICA
+# =============================================================================
+class AlzheimerAnalysisGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Sistema de Análise de Imagens - Alzheimer")
+        self.root.geometry("1200x800")
+        
+        # Variáveis de controle
+        self.current_image_data = None
+        self.current_metadata = None
+        self.current_slice_index = 0
+        self.current_axis = 2  # Axial
+        self.zoom_level = 1.0
+        
+        # Dataset paths
+        self.dataset_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'axl')
+        
+        # Modelos
+        self.svm_model = None
+        self.xgboost_model = None
+        self.densenet_classif = None
+        self.densenet_regress = None
+        
+        # Dados
+        self.train_data = None
+        self.val_data = None
+        self.test_data = None
+        self.valid_data_df = None
+        self.test_patients = None
+        
+        # Características extraídas
+        self.x_train_features = None
+        self.x_val_features = None
+        self.x_test_features = None
+        
+        # Acessibilidade - Tamanho de fonte
+        self.font_size = 12
+        self.base_font = ("Arial", self.font_size)
+        
+        self.setup_ui()
     
-    Parameters
-    ----------
-    filepath : str
-        Path to the .nii or .nii.gz file.
-    """
-    set_df = pd.read_csv('oasis_longitudinal_demographic.csv', sep=';')
-    paths = [os.path.join('axl', f"{mri_id}_axl.nii") for mri_id in set_df['MRI ID']]
-    # Load the NIfTI file
-    filepath=paths[0]
-    img = nib.load(filepath)
-    data = img.get_fdata()
-
-    # Ensure data is 3D
-    img = nib.load(filepath)
-    data = img.get_fdata()
-    header = img.header
-    affine = img.affine
-
-    # ================================
-    # PRINT METADATA
-    # ================================
-    print("\n=== MRI METADATA ===")
-    print(f"File: {filepath}")
-    print(f"Shape: {data.shape}")
-    print(f"Data Type: {header.get_data_dtype()}")
-    print(f"Voxel Dimensions (pixdim): {header['pixdim'][1:4]}")
-    print("\n--- Full Header ---")
-    print(header)   # prints ALL metadata fields
-
-    print("\n--- Affine Matrix (qform/sform) ---")
-    print(affine)
-
-    # -----------------------------
-    # CASE 1 → 2D IMAGE (single slice)
-    # -----------------------------
-    if data.ndim == 2:
-        plt.figure(figsize=(6, 6))
-        plt.imshow(data, cmap='gray')
-        plt.title(f"{mri_id} - Single Slice (2D)")
-        plt.axis("off")
-        plt.show()
-        return
-
-
+    def setup_ui(self):
+        """Configura a interface do usuário"""
+        # Estilo
+        self.style = ttk.Style()
+        self.style.configure("TButton", font=self.base_font, padding=5)
+        self.style.configure("TLabel", font=self.base_font)
+        
+        # Menu Superior
+        menu_bar = tk.Menu(self.root)
+        
+        # Menu Arquivo
+        menu_arquivo = tk.Menu(menu_bar, tearoff=0)
+        menu_arquivo.add_command(label="Carregar Imagem", command=self.carregar_dataset)
+        menu_arquivo.add_command(label="Carregar Arquivo Externo", command=self.carregar_arquivo_externo)
+        menu_arquivo.add_separator()
+        menu_arquivo.add_command(label="Sair", command=self.root.quit)
+        menu_bar.add_cascade(label="Arquivo", menu=menu_arquivo)
+        
+        # Menu Dados
+        menu_dados = tk.Menu(menu_bar, tearoff=0)
+        menu_dados.add_command(label="Preparar Dados (80/20)", command=self.preparar_dados)
+        menu_dados.add_command(label="Extrair Características", command=self.extrair_caracteristicas)
+        menu_bar.add_cascade(label="Dados", menu=menu_dados)
+        
+        # Menu SVM
+        menu_svm = tk.Menu(menu_bar, tearoff=0)
+        menu_svm.add_command(label="Treinar SVM", command=self.treinar_svm)
+        menu_svm.add_command(label="Avaliar SVM", command=self.avaliar_svm)
+        menu_svm.add_command(label="Matriz de Confusão", command=self.matriz_confusao_svm)
+        menu_bar.add_cascade(label="SVM", menu=menu_svm)
+        
+        # Menu XGBoost
+        menu_xgb = tk.Menu(menu_bar, tearoff=0)
+        menu_xgb.add_command(label="Treinar XGBoost", command=self.treinar_xgboost)
+        menu_xgb.add_command(label="Avaliar XGBoost", command=self.avaliar_xgboost)
+        menu_xgb.add_command(label="Análise Temporal", command=self.analise_temporal)
+        menu_bar.add_cascade(label="XGBoost", menu=menu_xgb)
+        
+        # Menu DenseNet
+        menu_densenet = tk.Menu(menu_bar, tearoff=0)
+        menu_densenet.add_command(label="Treinar Classificação", command=self.treinar_densenet_classif)
+        menu_densenet.add_command(label="Treinar Regressão", command=self.treinar_densenet_regress)
+        menu_densenet.add_separator()
+        menu_densenet.add_command(label="Avaliar Classificação", command=self.avaliar_densenet_classif)
+        menu_densenet.add_command(label="Avaliar Regressão", command=self.avaliar_densenet_regress)
+        menu_bar.add_cascade(label="DenseNet", menu=menu_densenet)
+        
+        # Menu Acessibilidade
+        menu_acess = tk.Menu(menu_bar, tearoff=0)
+        menu_acess.add_command(label="Aumentar Fonte", command=self.aumentar_fonte)
+        menu_acess.add_command(label="Diminuir Fonte", command=self.diminuir_fonte)
+        menu_bar.add_cascade(label="Acessibilidade", menu=menu_acess)
+        
+        self.root.config(menu=menu_bar)
+        
+        # Layout Principal
+        # Painel Esquerdo
+        self.painel_esquerdo = ttk.Frame(self.root, width=300)
+        self.painel_esquerdo.pack(side=tk.LEFT, fill=tk.BOTH, padx=10, pady=10)
+        
+        # Painel Direito
+        self.painel_direito = ttk.Frame(self.root)
+        self.painel_direito.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # === PAINEL ESQUERDO ===
+        ttk.Label(self.painel_esquerdo, text="Informações da Imagem", 
+                 font=("Arial", 14, "bold")).pack(pady=10)
+        
+        self.info_frame = ttk.LabelFrame(self.painel_esquerdo, text="Dados", padding=10)
+        self.info_frame.pack(fill=tk.X, pady=5)
+        
+        self.lbl_arquivo = ttk.Label(self.info_frame, text="Arquivo: Nenhum carregado")
+        self.lbl_arquivo.pack(anchor=tk.W)
+        
+        self.lbl_formato = ttk.Label(self.info_frame, text="Formato: -")
+        self.lbl_formato.pack(anchor=tk.W)
+        
+        self.lbl_dimensoes = ttk.Label(self.info_frame, text="Dimensões: -")
+        self.lbl_dimensoes.pack(anchor=tk.W)
+        
+        # Controles de navegação
+        self.nav_frame = ttk.LabelFrame(self.painel_esquerdo, text="Navegação", padding=10)
+        self.nav_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Label(self.nav_frame, text="Fatia:").pack(anchor=tk.W, pady=(5, 0))
+        self.slice_slider = ttk.Scale(self.nav_frame, from_=0, to=100, orient=tk.HORIZONTAL,
+                                     command=self.mudar_fatia)
+        self.slice_slider.pack(fill=tk.X)
+        
+        self.lbl_slice = ttk.Label(self.nav_frame, text="Fatia: 0/0")
+        self.lbl_slice.pack(anchor=tk.W)
+        
+        # Controles de zoom
+        self.zoom_frame = ttk.LabelFrame(self.painel_esquerdo, text="Zoom", padding=10)
+        self.zoom_frame.pack(fill=tk.X, pady=10)
+        
+        btn_frame = ttk.Frame(self.zoom_frame)
+        btn_frame.pack()
+        
+        ttk.Button(btn_frame, text="Zoom In (+)", command=self.zoom_in).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Zoom Out (-)", command=self.zoom_out).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Reset", command=self.zoom_reset).pack(side=tk.LEFT, padx=2)
+        
+        self.lbl_zoom = ttk.Label(self.zoom_frame, text="Zoom: 100%")
+        self.lbl_zoom.pack(pady=5)
+        
+        # === PAINEL DIREITO ===
+        self.fig = Figure(figsize=(8, 6), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("Visualizador de Imagens Médicas")
+        self.ax.axis('off')
+        
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.painel_direito)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        self.ax.text(0.5, 0.5, 'Carregue uma imagem\npelo menu Arquivo', 
+                    ha='center', va='center', fontsize=16, transform=self.ax.transAxes)
     
-    # -----------------------------
-    # CASE 2 → 3D IMAGE (multiple slices)
-    # -----------------------------
-    if data.ndim == 3:
-        num_slices = data.shape[2]
-
-        cols = 8
-        rows = int(np.ceil(num_slices / cols))
-
-        plt.figure(figsize=(15, rows * 2))
-
-        for i in range(num_slices):
-            plt.subplot(rows, cols, i + 1)
-            plt.imshow(data[:, :, i], cmap='gray')
-            plt.axis("off")
-
-        plt.suptitle(f"{mri_id} - All Slices")
-        plt.tight_layout()
-        plt.show()
-        return
-
-    # -----------------------------
-    # OTHER CASES (rare)
-    # -----------------------------
-    raise ValueError(f"Unexpected MRI shape: {data.shape}")
-
-
-
-
-
-    import numpy as np
-import cv2
-import matplotlib.pyplot as plt
-
-# ---------------------------
-# MAIN FUNCTION
-# ---------------------------
-def identify_ventricles(x_train_img):
-    # pick one image
-    img = x_train_img[0].astype(np.float32)   # (H, W)
-    h, w = img.shape
-
-    # show original
-    plt.figure(figsize=(6, 6))
-    plt.imshow(img, cmap='gray')
-    plt.title("Original image")
-    plt.axis("off")
-    plt.show()
-
-    # ---------------------------------------
-    # APPLY GAUSSIAN NOISE REMOVAL
-    # ---------------------------------------
-    # kernel size (5,5) is standard for MRI noise
-    img_denoised = cv2.GaussianBlur(img, (5, 5), sigmaX=1)
-
-    plt.figure(figsize=(6, 6))
-    plt.imshow(img_denoised, cmap='gray')
-    plt.title("After Gaussian Noise Removal")
-    plt.axis("off")
-    plt.show()
-
-    # ---------------------------------------
-    # PREP FOR K-MEANS
-    # reshape to (H*W, 1)
-    # ---------------------------------------
-    pixel_vals_train = img_denoised.reshape((-1, 1)).astype(np.float32)
-
-    # ---------------------------------------
-    # K-MEANS CLUSTERING
-    # ---------------------------------------
-    criteria = (
-        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-        100,
-        0.85
-    )
-
-    k = 2
-    retval, labels, centers = cv2.kmeans(
-        pixel_vals_train,
-        k,
-        None,
-        criteria,
-        10,
-        cv2.KMEANS_RANDOM_CENTERS
-    )
-
-    # convert cluster centers to grayscale 0–255
-    centers = np.uint8(centers)
-
-    # replace pixels with their cluster center
-    segmented_data = centers[labels.flatten()]
-    segmented_image = segmented_data.reshape((h, w))
-
-    # show segmented image
-    plt.figure(figsize=(6, 6))
-    plt.imshow(segmented_image, cmap='gray')
-    plt.title(f"K-means segmented image (k={k})")
-    plt.axis("off")
-    plt.show()
-
-    return segmented_image
-
-
-
-
-
+    # =========================================================================
+    # FUNÇÕES DE CARREGAMENTO DE IMAGEM
+    # =========================================================================
+    def carregar_dataset(self):
+        """Carrega uma imagem do dataset"""
+        if not os.path.exists(self.dataset_path):
+            messagebox.showerror("Erro", f"Diretório não encontrado: {self.dataset_path}")
+            return
+        
+        files = [f for f in os.listdir(self.dataset_path) if f.endswith('.nii')]
+        if not files:
+            messagebox.showerror("Erro", "Nenhuma imagem .nii encontrada")
+            return
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Selecionar Imagem")
+        dialog.geometry("400x500")
+        
+        ttk.Label(dialog, text="Imagens Disponíveis:", font=("Arial", 12, "bold")).pack(pady=10)
+        
+        listbox = tk.Listbox(dialog, font=("Arial", 10))
+        listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        for f in sorted(files):
+            listbox.insert(tk.END, f)
+        
+        def selecionar():
+            selection = listbox.curselection()
+            if selection:
+                filename = listbox.get(selection[0])
+                filepath = os.path.join(self.dataset_path, filename)
+                dialog.destroy()
+                self.carregar_e_exibir(filepath)
+        
+        ttk.Button(dialog, text="Carregar", command=selecionar).pack(pady=10)
     
+    def carregar_arquivo_externo(self):
+        """Carrega arquivo externo (NIfTI, PNG, JPG)"""
+        filetypes = [
+            ("Todos os suportados", "*.nii *.nii.gz *.png *.jpg *.jpeg"),
+            ("NIfTI", "*.nii *.nii.gz"),
+            ("Imagens", "*.png *.jpg *.jpeg")
+        ]
+        filepath = filedialog.askopenfilename(title="Selecionar Imagem", filetypes=filetypes)
+        if filepath:
+            self.carregar_e_exibir(filepath)
     
+    def carregar_e_exibir(self, filepath):
+        """Carrega e exibe uma imagem"""
+        try:
+            self.current_image_data, self.current_metadata = ImageLoader.load_image(filepath)
+            
+            self.lbl_arquivo.config(text=f"Arquivo: {os.path.basename(filepath)}")
+            self.lbl_formato.config(text=f"Formato: {self.current_metadata['format']}")
+            self.lbl_dimensoes.config(text=f"Dimensões: {self.current_metadata['shape']}")
+            
+            if len(self.current_metadata['shape']) == 3:
+                max_slice = self.current_metadata['shape'][self.current_axis] - 1
+                self.slice_slider.config(to=max_slice)
+                self.current_slice_index = max_slice // 2
+                self.slice_slider.set(self.current_slice_index)
+            else:
+                self.slice_slider.config(to=0)
+                self.current_slice_index = 0
+            
+            self.zoom_level = 1.0
+            self.exibir_imagem()
+            
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao carregar imagem:\n{str(e)}")
     
+    def exibir_imagem(self):
+        """Exibe a imagem atual no canvas"""
+        if self.current_image_data is None:
+            return
+        
+        self.ax.clear()
+        
+        if len(self.current_image_data.shape) == 3:
+            slice_data = ImageLoader.get_slice(self.current_image_data, 
+                                              self.current_axis, 
+                                              self.current_slice_index)
+            max_slice = self.current_image_data.shape[self.current_axis] - 1
+            self.lbl_slice.config(text=f"Fatia: {self.current_slice_index}/{max_slice}")
+        else:
+            slice_data = self.current_image_data
+        
+        display_data = ImageLoader.normalize_for_display(slice_data)
+        
+        self.ax.imshow(display_data, cmap='gray')
+        self.ax.set_title(f"{os.path.basename(self.current_metadata['file_path'])} - Zoom: {int(self.zoom_level*100)}%")
+        self.ax.axis('off')
+        
+        if self.zoom_level != 1.0:
+            xlim = self.ax.get_xlim()
+            ylim = self.ax.get_ylim()
+            x_center = (xlim[0] + xlim[1]) / 2
+            y_center = (ylim[0] + ylim[1]) / 2
+            x_range = (xlim[1] - xlim[0]) / self.zoom_level
+            y_range = (ylim[1] - ylim[0]) / self.zoom_level
+            self.ax.set_xlim(x_center - x_range/2, x_center + x_range/2)
+            self.ax.set_ylim(y_center - y_range/2, y_center + y_range/2)
+        
+        self.canvas.draw()
+    
+    # =========================================================================
+    # CONTROLES DE NAVEGAÇÃO E ZOOM
+    # =========================================================================
+    def mudar_fatia(self, value):
+        self.current_slice_index = int(float(value))
+        self.exibir_imagem()
+    
+    def zoom_in(self):
+        self.zoom_level *= 1.2
+        self.lbl_zoom.config(text=f"Zoom: {int(self.zoom_level*100)}%")
+        self.exibir_imagem()
+    
+    def zoom_out(self):
+        self.zoom_level /= 1.2
+        if self.zoom_level < 0.5:
+            self.zoom_level = 0.5
+        self.lbl_zoom.config(text=f"Zoom: {int(self.zoom_level*100)}%")
+        self.exibir_imagem()
+    
+    def zoom_reset(self):
+        self.zoom_level = 1.0
+        self.lbl_zoom.config(text=f"Zoom: {int(self.zoom_level*100)}%")
+        self.exibir_imagem()
+    
+    # =========================================================================
+    # FUNÇÕES DE PROCESSAMENTO
+    # =========================================================================
+    def preparar_dados(self):
+        """Prepara dados com split 80/20"""
+        try:
+            messagebox.showinfo("Preparando Dados", "Carregando e preparando dados...\nIsso pode levar alguns minutos.")
+            self.train_data, self.val_data, self.test_data, self.valid_data_df, self.test_patients = load_and_prepare_data()
+            messagebox.showinfo("Sucesso", f"Dados preparados com sucesso!\n\n"
+                              f"Treino: {len(self.train_data[0])} imagens\n"
+                              f"Validação: {len(self.val_data[0])} imagens\n"
+                              f"Teste: {len(self.test_data[0])} imagens")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao preparar dados:\n{str(e)}")
+    
+    def extrair_caracteristicas(self):
+        """Extrai características GLCM das imagens"""
+        if self.train_data is None:
+            messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
+            return
+        
+        try:
+            messagebox.showinfo("Extraindo", "Extraindo características...\nIsso pode levar alguns minutos.")
+            self.x_train_features = extract_features(self.train_data[0])
+            self.x_val_features = extract_features(self.val_data[0])
+            self.x_test_features = extract_features(self.test_data[0])
+            messagebox.showinfo("Sucesso", "Características extraídas com sucesso!")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao extrair características:\n{str(e)}")
+    
+    # =========================================================================
+    # SVM - CLASSIFICADOR RASO
+    # =========================================================================
+    def treinar_svm(self):
+        """Treina SVM"""
+        if self.x_train_features is None:
+            messagebox.showwarning("Aviso", "Extraia as características primeiro!")
+            return
+        
+        try:
+            messagebox.showinfo("Treinando", "Treinando SVM...")
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(self.x_train_features)
+            self.svm_model = SVC(kernel='rbf', C=1.0, gamma='scale', random_state=42)
+            self.svm_model.fit(X_train_scaled, self.train_data[1])
+            self.svm_scaler = scaler
+            messagebox.showinfo("Sucesso", "SVM treinado com sucesso!")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao treinar SVM:\n{str(e)}")
+    
+    def avaliar_svm(self):
+        """Avalia SVM no conjunto de teste"""
+        if self.svm_model is None:
+            messagebox.showwarning("Aviso", "Treine o SVM primeiro!")
+            return
+        
+        try:
+            X_test_scaled = self.svm_scaler.transform(self.x_test_features)
+            y_pred = self.svm_model.predict(X_test_scaled)
+            acc, sens, spec, cm = evaluate_classifier(self.test_data[1], y_pred, "SVM")
+            
+            messagebox.showinfo("Resultados SVM", 
+                              f"Acurácia: {acc:.4f}\n"
+                              f"Sensibilidade: {sens:.4f}\n"
+                              f"Especificidade: {spec:.4f}")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao avaliar SVM:\n{str(e)}")
+    
+    def matriz_confusao_svm(self):
+        """Mostra matriz de confusão do SVM"""
+        if self.svm_model is None:
+            messagebox.showwarning("Aviso", "Treine o SVM primeiro!")
+            return
+        
+        try:
+            X_test_scaled = self.svm_scaler.transform(self.x_test_features)
+            y_pred = self.svm_model.predict(X_test_scaled)
+            cm = confusion_matrix(self.test_data[1], y_pred)
+            
+            plt.figure(figsize=(6, 5))
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+            plt.title('Matriz de Confusão - SVM')
+            plt.ylabel('Real')
+            plt.xlabel('Predito')
+            plt.show()
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro:\n{str(e)}")
+    
+    # =========================================================================
+    # XGBOOST - REGRESSOR RASO
+    # =========================================================================
+    def treinar_xgboost(self):
+        """Treina XGBoost para regressão de idade"""
+        if self.x_train_features is None:
+            messagebox.showwarning("Aviso", "Extraia as características primeiro!")
+            return
+        
+        try:
+            messagebox.showinfo("Treinando", "Treinando XGBoost...")
+            self.xgboost_model = xgb.XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.1, random_state=42)
+            self.xgboost_model.fit(self.x_train_features, self.train_data[2])
+            messagebox.showinfo("Sucesso", "XGBoost treinado com sucesso!")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao treinar XGBoost:\n{str(e)}")
+    
+    def avaliar_xgboost(self):
+        """Avalia XGBoost"""
+        if self.xgboost_model is None:
+            messagebox.showwarning("Aviso", "Treine o XGBoost primeiro!")
+            return
+        
+        try:
+            y_pred = self.xgboost_model.predict(self.x_test_features)
+            mae = mean_absolute_error(self.test_data[2], y_pred)
+            messagebox.showinfo("Resultados XGBoost", f"MAE: {mae:.2f} anos")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro:\n{str(e)}")
+    
+    def analise_temporal(self):
+        """Análise temporal - visitas posteriores têm idades maiores?"""
+        if self.xgboost_model is None:
+            messagebox.showwarning("Aviso", "Treine o XGBoost primeiro!")
+            return
+        
+        try:
+            y_pred = self.xgboost_model.predict(self.x_test_features)
+            test_data_df = self.valid_data_df[self.valid_data_df['Subject ID'].isin(self.test_patients['Subject ID'])]
+            test_data_df = test_data_df.copy()
+            test_data_df['predicted_age'] = y_pred[:len(test_data_df)]
+            
+            consistent_increase = 0
+            total_patients = 0
+            
+            for subject_id, group in test_data_df.sort_values(['Subject ID', 'Visit']).groupby('Subject ID'):
+                if len(group) > 1:
+                    total_patients += 1
+                    predicted_ages = group['predicted_age'].values
+                    if np.all(np.diff(predicted_ages) >= 0):
+                        consistent_increase += 1
+            
+            ratio = (consistent_increase / total_patients * 100) if total_patients > 0 else 0
+            messagebox.showinfo("Análise Temporal", 
+                              f"Pacientes com múltiplas visitas: {total_patients}\n"
+                              f"Com idades crescentes: {consistent_increase}\n"
+                              f"Percentual: {ratio:.1f}%")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro:\n{str(e)}")
+    
+    # =========================================================================
+    # DENSENET - MODELO PROFUNDO
+    # =========================================================================
+    def treinar_densenet_classif(self):
+        """Treina DenseNet para classificação"""
+        if self.train_data is None:
+            messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
+            return
+        
+        messagebox.showinfo("DenseNet", "Treinamento de DenseNet para classificação\n"
+                          "será implementado aqui com fine-tuning.")
+    
+    def treinar_densenet_regress(self):
+        """Treina DenseNet para regressão"""
+        if self.train_data is None:
+            messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
+            return
+        
+        messagebox.showinfo("DenseNet", "Treinamento de DenseNet para regressão\n"
+                          "será implementado aqui com fine-tuning.")
+    
+    def avaliar_densenet_classif(self):
+        """Avalia DenseNet classificação"""
+        messagebox.showinfo("DenseNet", "Avaliação de DenseNet Classificação")
+    
+    def avaliar_densenet_regress(self):
+        """Avalia DenseNet regressão"""
+        messagebox.showinfo("DenseNet", "Avaliação de DenseNet Regressão")
+    
+    # =========================================================================
+    # ACESSIBILIDADE
+    # =========================================================================
+    def atualizar_fontes(self):
+        """Atualiza o tamanho de todas as fontes"""
+        self.base_font = ("Arial", self.font_size)
+        self.style.configure("TButton", font=self.base_font)
+        self.style.configure("TLabel", font=self.base_font)
+        
+        # Atualiza labels
+        for widget in [self.lbl_arquivo, self.lbl_formato, self.lbl_dimensoes, 
+                      self.lbl_slice, self.lbl_zoom]:
+            widget.config(font=self.base_font)
+    
+    def aumentar_fonte(self):
+        """Aumenta o tamanho da fonte"""
+        self.font_size += 2
+        self.atualizar_fontes()
+        messagebox.showinfo("Acessibilidade", f"Fonte aumentada para {self.font_size}pt")
+    
+    def diminuir_fonte(self):
+        """Diminui o tamanho da fonte"""
+        if self.font_size > 8:
+            self.font_size -= 2
+            self.atualizar_fontes()
+            messagebox.showinfo("Acessibilidade", f"Fonte reduzida para {self.font_size}pt")
 
-
-
-# --- Main Execution ---
-
-if __name__ == '__main__':
-    plot_mri_image("OAS2_0001")
-    # --- Data Loading ---
-    #works by each () being a return parameter of  load_and_prepare_data function
-    (x_train_img, y_train_class, y_train_age), \
-    (x_val_img, y_val_class, y_val_age), \
-    (x_test_img, y_test_class, y_test_age), \
-    valid_data_df, test_patients = load_and_prepare_data() # Added return values
-    identify_ventricles(x_train_img)
-    print("\n--- TASK 1: CLASSIFICATION (Demented vs. NonDemented) ---")
-
-    
-    # --- Feature Extraction and Scaling for Shallow Models ---
-    print("Extracting features for shallow classification models...")
-    x_train_features = extract_features(x_train_img)
-    x_test_features = extract_features(x_test_img)
-    print(f"Feature extraction complete. Feature shape: {x_train_features.shape}")
-
-    print("Scaling features...")
-    scaler = StandardScaler()
-    x_train_features_scaled = scaler.fit_transform(x_train_features)
-    x_test_features_scaled = scaler.transform(x_test_features)
-    
-    # --- Shallow Model: SVM Classifier ---
-    print("\nTraining SVM Classifier...")
-    svm_classifier = SVC(kernel='rbf', probability=True, random_state=42)
-    svm_classifier.fit(x_train_features_scaled, y_train_class)
-    y_pred_svm = svm_classifier.predict(x_test_features_scaled)
-    evaluate_classifier(y_test_class, y_pred_svm, "SVM Classifier")
-
-    # --- Deep Model: DenseNet Classifier ---
-    x_train_deep = np.stack([x_train_img, x_train_img, x_train_img], axis=-1)
-    x_val_deep = np.stack([x_val_img, x_val_img, x_val_img], axis=-1)
-    x_test_deep = np.stack([x_test_img, x_test_img, x_test_img], axis=-1)
-
-    print("\nCreating and fine-tuning DenseNet Classifier...")
-    base_model_clf = DenseNet121(weights='imagenet', include_top=False, input_shape=(128, 128, 3))
-    base_model_clf.trainable = False # Freeze base
-    
-    x = Flatten()(base_model_clf.output)
-    x = Dense(512, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    output_clf = Dense(1, activation='sigmoid')(x)
-    
-    model_clf = Model(inputs=base_model_clf.input, outputs=output_clf)
-    model_clf.compile(loss='binary_crossentropy', optimizer='Adamax', metrics=['accuracy'])
-    
-    history_clf = model_clf.fit(
-        x_train_deep, y_train_class,
-        validation_data=(x_val_deep, y_val_class),
-        epochs=10, batch_size=16, verbose=1
-    )
-    
-    plot_learning_curves(history_clf, "DenseNet Classifier")
-    y_pred_deep_clf_proba = model_clf.predict(x_test_deep)
-    y_pred_deep_clf = (y_pred_deep_clf_proba > 0.5).astype(int)
-    evaluate_classifier(y_test_class, y_pred_deep_clf, "DenseNet Classifier")
-
-
-    print("\n--- TASK 2: REGRESSION (Predicting Patient Age) ---")
-
-    # --- Shallow Model: XGBoost Regressor ---
-    print("\nTraining XGBoost Regressor...")
-    xgb_regressor = xgb.XGBRegressor(objective='reg:squarederror', random_state=42)
-    # Note: Using scaled features as well for the regressor
-    xgb_regressor.fit(x_train_features_scaled, y_train_age)
-    y_pred_age_xgb = xgb_regressor.predict(x_test_features_scaled)
-    mae_xgb = mean_absolute_error(y_test_age, y_pred_age_xgb)
-    print(f"--- XGBoost Regressor Evaluation ---")
-    print(f"Mean Absolute Error (MAE): {mae_xgb:.4f} years")
-    print("------------------------------------\n")
-
-    # --- Deep Model: DenseNet Regressor ---
-    print("\nCreating and fine-tuning DenseNet Regressor...")
-    base_model_reg = DenseNet121(weights='imagenet', include_top=False, input_shape=(128, 128, 3))
-    base_model_reg.trainable = False
-    
-    x_reg = Flatten()(base_model_reg.output)
-    x_reg = Dense(512, activation='relu')(x_reg)
-    x_reg = Dropout(0.5)(x_reg)
-    output_reg = Dense(1, activation='linear')(x_reg) # Linear activation for regression
-    
-    model_reg = Model(inputs=base_model_reg.input, outputs=output_reg)
-    model_reg.compile(loss='mean_squared_error', optimizer='Adamax', metrics=['mae'])
-    
-    history_reg = model_reg.fit(
-        x_train_deep, y_train_age,
-        validation_data=(x_val_deep, y_val_age),
-        epochs=10, batch_size=16, verbose=1
-    )
-    
-    y_pred_age_deep = model_reg.predict(x_test_deep).flatten()
-    mae_deep = mean_absolute_error(y_test_age, y_pred_age_deep)
-    print(f"--- DenseNet Regressor Evaluation ---")
-    print(f"Mean Absolute Error (MAE): {mae_deep:.4f} years")
-    print("-------------------------------------\n")
-
-    # --- Analysis Questions ---
-    print("\n--- Analysis Questions ---")
-    print("1. Are the inputs sufficient for a good prediction?")
-    print(f"For age prediction, the shallow model (XGBoost) had an MAE of {mae_xgb:.2f} years, and the deep model (DenseNet) had an MAE of {mae_deep:.2f} years. This indicates the models have some predictive power, but there's room for improvement. The image features seem to provide a reasonable but not perfect estimation of age.")
-    
-    print("\n2. Do later visits result in higher predicted ages?")
-    
-    # Re-fetch the test set data needed for this analysis, now that valid_data_df and test_patients are available
-    test_analysis_df = valid_data_df[valid_data_df['Subject ID'].isin(test_patients['Subject ID'])].copy()
-    test_analysis_paths = [os.path.join('axl', f"{mri_id}_axl.nii") for mri_id in test_analysis_df['MRI ID']]
-    x_test_img_analysis = load_images(test_analysis_paths)
-    x_test_features_analysis = extract_features(x_test_img_analysis)
-    x_test_features_analysis_scaled = scaler.transform(x_test_features_analysis) # Use the same scaler fitted on training data
-    
-    test_analysis_df['predicted_age_xgb'] = xgb_regressor.predict(x_test_features_analysis_scaled)
-    
-    consistent_increase = 0
-    total_patients_mv = 0
-    
-    # Sort by Subject ID and then by Visit to ensure correct order for diff
-    for subject_id, group in test_analysis_df.sort_values(['Subject ID', 'Visit']).groupby('Subject ID'):
-        if len(group) > 1: # Only consider patients with multiple visits
-            total_patients_mv += 1
-            predicted_ages = group['predicted_age_xgb'].values
-            if np.all(np.diff(predicted_ages) >= 0):
-                consistent_increase += 1
-    
-    if total_patients_mv > 0:
-        consistency_ratio = consistent_increase / total_patients_mv
-        print(f"For the XGBoost regressor, {consistency_ratio:.2%} of patients with multiple visits showed consistently non-decreasing predicted ages.")
-    else:
-        print("Not enough data with multiple visits in the test set to perform this analysis.")
-    print("--------------------------")
-    print("identify_ventricle")
-   
+# =============================================================================
+# MAIN
+# =============================================================================
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = AlzheimerAnalysisGUI(root)
+    root.mainloop()

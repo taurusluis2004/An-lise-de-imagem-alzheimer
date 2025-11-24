@@ -53,7 +53,9 @@ def load_and_prepare_data():
         test_patients # Added return
     """
     # Read and clean the demographic data
-    demographics_df = pd.read_csv('oasis_longitudinal_demographic.csv', sep=';')
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(base_dir, 'oasis_longitudinal_demographic.csv')
+    demographics_df = pd.read_csv(csv_path, sep=';')
     demographics_df['CDR'] = demographics_df['CDR'].astype(str).str.replace(',', '.', regex=False)
     demographics_df['CDR'] = pd.to_numeric(demographics_df['CDR'], errors='coerce')
     demographics_df['Age'] = pd.to_numeric(demographics_df['Age'], errors='coerce')
@@ -101,7 +103,8 @@ def load_and_prepare_data():
     # --- Get Image Paths and Labels for each set ---
     def get_set_data(patient_ids_df, full_df):
         set_df = full_df[full_df['Subject ID'].isin(patient_ids_df['Subject ID'])]
-        paths = [os.path.join('axl', f"{mri_id}_axl.nii") for mri_id in set_df['MRI ID']]
+        axl_dir = os.path.join(base_dir, 'axl')
+        paths = [os.path.join(axl_dir, f"{mri_id}_axl.nii") for mri_id in set_df['MRI ID']]
         class_labels = le.transform(set_df['Diagnosis'])
         age_labels = set_df['Age'].values
         return paths, class_labels, age_labels
@@ -171,8 +174,11 @@ def plot_mri_image(mri_id):
     filepath : str
         Path to the .nii or .nii.gz file.
     """
-    set_df = pd.read_csv('oasis_longitudinal_demographic.csv', sep=';')
-    paths = [os.path.join('axl', f"{mri_id}_axl.nii") for mri_id in set_df['MRI ID']]
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(base_dir, 'oasis_longitudinal_demographic.csv')
+    set_df = pd.read_csv(csv_path, sep=';')
+    axl_dir = os.path.join(base_dir, 'axl')
+    paths = [os.path.join(axl_dir, f"{mri_id}_axl.nii") for mri_id in set_df['MRI ID']]
     # Load the NIfTI file
     filepath=paths[0]
     img = nib.load(filepath)
