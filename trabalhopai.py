@@ -6,7 +6,6 @@
 # =============================================================================
 import numpy as np 
 import os
-import sys
 import pandas as pd 
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -20,6 +19,8 @@ import xgboost as xgb
 import nibabel as nib
 from skimage.transform import resize
 from skimage.feature import graycomatrix, graycoprops
+from skimage.measure import label, regionprops
+import cv2
 from PIL import Image
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -28,9 +29,6 @@ from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D
 from tensorflow.keras.applications import DenseNet121
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import Callback
-
-# Força flush automático para ver prints em tempo real
-sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
 
 # =============================================================================
 # CALLBACK CUSTOMIZADO PARA TESTE
@@ -174,25 +172,14 @@ def load_images(paths):
 
 def load_and_prepare_data():
     """Preparação detalhada dos dados por paciente (split 80/20 + validação).
-    Usa oasis_longitudinal_demographic.csv como base demográfica.
     Retorna também estrutura 'split_info' com DataFrames e estatísticas.
     """
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    # CSV demográfico original para classificação
     csv_path = os.path.join(base_dir, 'oasis_longitudinal_demographic.csv')
     demographics_df = pd.read_csv(csv_path, sep=';')
     demographics_df['CDR'] = demographics_df['CDR'].astype(str).str.replace(',', '.', regex=False)
     demographics_df['CDR'] = pd.to_numeric(demographics_df['CDR'], errors='coerce')
     demographics_df['Age'] = pd.to_numeric(demographics_df['Age'], errors='coerce')
-    
-    # Carrega planilha.csv para features morfológicas (usado em regressão)
-    planilha_path = os.path.join(base_dir, 'planilha.csv')
-    planilha_df = pd.read_csv(planilha_path)
-    # Normaliza colunas numéricas da planilha
-    for col in ['CDR', 'Age', 'area', 'perimeter', 'circularity', 'eccentricity', 'solidity', 'extent', 'mean_intensity']:
-        if col in planilha_df.columns:
-            planilha_df[col] = planilha_df[col].astype(str).str.replace(',', '.', regex=False)
-            planilha_df[col] = pd.to_numeric(planilha_df[col], errors='coerce')
 
     def get_diagnosis_binary(row):
         if row['Group'] == 'Nondemented':
@@ -248,8 +235,7 @@ def load_and_prepare_data():
         'label_encoder': le,
         'num_train_exams': len(train_paths),
         'num_val_exams': len(val_paths),
-        'num_test_exams': len(test_paths),
-        'planilha_df': planilha_df  # Adiciona planilha para uso em regressão
+        'num_test_exams': len(test_paths)
     }
 
     return (x_train_img, y_train_class, y_train_age), \
@@ -282,34 +268,6 @@ def extract_features(images):
             vec.append(np.mean(q)); vec.append(np.std(q))
         features.append(vec)
     return np.array(features, dtype=np.float32)
-
-def extract_morphological_features(data_df, mri_ids):
-    """Extrai features morfológicas (area, perimeter, circularity, etc.) da planilha."""
-    morpho = []
-    def sf(v, default):
-        if pd.isna(v): return default
-        if isinstance(v,str):
-            v = v.replace(',','.')
-        try:
-            return float(v)
-        except:
-            return default
-    for mri in mri_ids:
-        row = data_df[data_df['MRI ID']==mri]
-        if len(row)==0:
-            # Defaults se registro não encontrado
-            morpho.append([1000.0, 300.0, 0.15, 0.7, 0.6, 0.4, 30.0]); continue
-        r = row.iloc[0]
-        morpho.append([
-            sf(r.get('area', 1000.0), 1000.0),
-            sf(r.get('perimeter', 300.0), 300.0),
-            sf(r.get('circularity', 0.15), 0.15),
-            sf(r.get('eccentricity', 0.7), 0.7),
-            sf(r.get('solidity', 0.6), 0.6),
-            sf(r.get('extent', 0.4), 0.4),
-            sf(r.get('mean_intensity', 30.0), 30.0)
-        ])
-    return np.array(morpho, dtype=np.float32)
 
 def extract_clinical_features(data_df, mri_ids):
     """Extrai features clínicas (EDUC, MMSE, eTIV, nWBV, ASF, Visit, Years_since_first, CDR)."""
@@ -442,9 +400,7 @@ class AlzheimerAnalysisGUI:
         # Menu Dados
         menu_dados = tk.Menu(menu_bar, tearoff=0)
         menu_dados.add_command(label="Preparar Dados (80/20)", command=self.preparar_dados)
-        menu_dados.add_separator()
-        menu_dados.add_command(label="Extrair Características (Classificação)", command=self.extrair_caracteristicas)
-        menu_dados.add_command(label="Extrair Características (Regressão)", command=self.extrair_caracteristicas_regressao)
+        menu_dados.add_command(label="Extrair Características", command=self.extrair_caracteristicas)
         menu_bar.add_cascade(label="Dados", menu=menu_dados)
         
         # Menu SVM
@@ -738,68 +694,29 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Erro ao preparar dados:\n{str(e)}")
     
     def extrair_caracteristicas(self):
-        """Extrai características para CLASSIFICAÇÃO (SVM): textura + clínicas do OASIS"""
+        """Extrai características GLCM das imagens"""
         if self.train_data is None:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
         
         try:
-            messagebox.showinfo("Extraindo", "Extraindo características para CLASSIFICAÇÃO...\nIsso pode levar alguns minutos.")
-            # Textura das imagens
+            messagebox.showinfo("Extraindo", "Extraindo características...\nIsso pode levar alguns minutos.")
+            # Textura
             tex_train = extract_features(self.train_data[0])
             tex_val = extract_features(self.val_data[0])
             tex_test = extract_features(self.test_data[0])
-            
-            # Clínicas do OASIS (sem features morfológicas para classificação)
+            # Clínicas (usa DataFrames do split_info)
             train_mri_ids = self.split_info['train_df']['MRI ID'].tolist()
             val_mri_ids = self.split_info['val_df']['MRI ID'].tolist()
             test_mri_ids = self.split_info['test_df']['MRI ID'].tolist()
             clin_train = extract_clinical_features(self.valid_data_df, train_mri_ids)
             clin_val = extract_clinical_features(self.valid_data_df, val_mri_ids)
             clin_test = extract_clinical_features(self.valid_data_df, test_mri_ids)
-            
-            # Concatena APENAS textura + clínica (SEM morfológicas)
+            # Concatena (textura + clínica)
             self.x_train_features = np.concatenate([tex_train, clin_train], axis=1)
             self.x_val_features = np.concatenate([tex_val, clin_val], axis=1)
             self.x_test_features = np.concatenate([tex_test, clin_test], axis=1)
-            
-            messagebox.showinfo("Sucesso", f"Características para CLASSIFICAÇÃO extraídas!\nDimensão: {self.x_train_features.shape[1]} (textura + clínicas OASIS)")
-        except Exception as e:
-            messagebox.showerror("Erro", f"Erro ao extrair características:\n{str(e)}")
-    
-    def extrair_caracteristicas_regressao(self):
-        """Extrai características para REGRESSÃO (XGBoost): textura + morfológicas + clínicas"""
-        if self.train_data is None:
-            messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
-            return
-        
-        try:
-            messagebox.showinfo("Extraindo", "Extraindo características para REGRESSÃO...\nIsso pode levar alguns minutos.")
-            # Textura das imagens
-            tex_train = extract_features(self.train_data[0])
-            tex_val = extract_features(self.val_data[0])
-            tex_test = extract_features(self.test_data[0])
-            
-            # Morfológicas da PLANILHA.CSV
-            train_mri_ids = self.split_info['train_df']['MRI ID'].tolist()
-            val_mri_ids = self.split_info['val_df']['MRI ID'].tolist()
-            test_mri_ids = self.split_info['test_df']['MRI ID'].tolist()
-            planilha_df = self.split_info['planilha_df']
-            morph_train = extract_morphological_features(planilha_df, train_mri_ids)
-            morph_val = extract_morphological_features(planilha_df, val_mri_ids)
-            morph_test = extract_morphological_features(planilha_df, test_mri_ids)
-            
-            # Clínicas do OASIS
-            clin_train = extract_clinical_features(self.valid_data_df, train_mri_ids)
-            clin_val = extract_clinical_features(self.valid_data_df, val_mri_ids)
-            clin_test = extract_clinical_features(self.valid_data_df, test_mri_ids)
-            
-            # Concatena textura + morfológicas + clínica
-            self.x_train_features_reg = np.concatenate([tex_train, morph_train, clin_train], axis=1)
-            self.x_val_features_reg = np.concatenate([tex_val, morph_val, clin_val], axis=1)
-            self.x_test_features_reg = np.concatenate([tex_test, morph_test, clin_test], axis=1)
-            
-            messagebox.showinfo("Sucesso", f"Características para REGRESSÃO extraídas!\nDimensão: {self.x_train_features_reg.shape[1]} (textura + morfológicas PLANILHA + clínicas)")
+            messagebox.showinfo("Sucesso", f"Características extraídas!\nDimensão final: {self.x_train_features.shape[1]}")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao extrair características:\n{str(e)}")
     
@@ -866,13 +783,13 @@ class AlzheimerAnalysisGUI:
     # XGBOOST - REGRESSOR RASO
     # =========================================================================
     def treinar_xgboost(self):
-        """Treina XGBoost para regressão de idade usando features de REGRESSÃO"""
-        if not hasattr(self, 'x_train_features_reg') or self.x_train_features_reg is None:
-            messagebox.showwarning("Aviso", "Extraia as características de REGRESSÃO primeiro!\nUse: Dados → Extrair Características Regressão")
+        """Treina XGBoost para regressão de idade"""
+        if self.x_train_features is None:
+            messagebox.showwarning("Aviso", "Extraia as características primeiro!")
             return
         
         try:
-            messagebox.showinfo("Treinando", "Treinando XGBoost com features morfológicas...")
+            messagebox.showinfo("Treinando", "Treinando XGBoost...")
             params = dict(
                 n_estimators=400,
                 max_depth=6,
@@ -888,15 +805,15 @@ class AlzheimerAnalysisGUI:
             try:
                 # Tentativa com early stopping e eval_set (APIs mais novas)
                 self.xgboost_model.fit(
-                    self.x_train_features_reg,
+                    self.x_train_features,
                     self.train_data[2],
-                    eval_set=[(self.x_val_features_reg, self.val_data[2])],
+                    eval_set=[(self.x_val_features, self.val_data[2])],
                     early_stopping_rounds=30,
                     verbose=False
                 )
             except TypeError:
                 # Fallback para APIs antigas sem esses kwargs
-                self.xgboost_model.fit(self.x_train_features_reg, self.train_data[2])
+                self.xgboost_model.fit(self.x_train_features, self.train_data[2])
             # Recupera melhor iteração de forma robusta (difere por versão do XGBoost)
             best_iter = getattr(self.xgboost_model, 'best_iteration', None)
             if best_iter is None:
@@ -920,7 +837,7 @@ class AlzheimerAnalysisGUI:
         
         try:
             y_true = self.test_data[2]
-            y_pred = self.xgboost_model.predict(self.x_test_features_reg)
+            y_pred = self.xgboost_model.predict(self.x_test_features)
             mae = mean_absolute_error(y_true, y_pred)
             # Compatível com versões antigas do scikit-learn (sem parâmetro 'squared')
             rmse = np.sqrt(mean_squared_error(y_true, y_pred))
@@ -953,7 +870,7 @@ class AlzheimerAnalysisGUI:
             return
         
         try:
-            y_pred = self.xgboost_model.predict(self.x_test_features_reg)
+            y_pred = self.xgboost_model.predict(self.x_test_features)
             # DataFrame de teste completo
             test_df = self.split_info['test_df'].copy()
             test_df = test_df.sort_values(['Subject ID','Visit'])
@@ -1007,20 +924,13 @@ class AlzheimerAnalysisGUI:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
         try:
-            print("\n=== INICIANDO TREINAMENTO DENSENET CLASSIFICAÇÃO ===")
-            sys.stdout.flush()
             x_train, y_train, _ = self.train_data
             x_val, y_val, _ = self.val_data
             x_test, y_test, _ = self.test_data
-            
-            print("Preparando imagens para DenseNet (224x224x3)...")
-            sys.stdout.flush()
+            messagebox.showinfo("DenseNet", "Preparando imagens para DenseNet...")
             self.x_train_densenet = self._prepare_images_densenet(x_train)
-            print(f"  - Treino: {self.x_train_densenet.shape}")
             self.x_val_densenet = self._prepare_images_densenet(x_val)
-            print(f"  - Validação: {self.x_val_densenet.shape}")
             self.x_test_densenet = self._prepare_images_densenet(x_test)
-            print(f"  - Teste: {self.x_test_densenet.shape}")
 
             base = DenseNet121(weights='imagenet', include_top=False, input_shape=(224,224,3))
             for layer in base.layers:
@@ -1035,30 +945,26 @@ class AlzheimerAnalysisGUI:
             model.compile(optimizer=Adam(learning_rate=1e-3), loss='binary_crossentropy', metrics=['accuracy'])
 
             cb_test = TestAccuracyCallback(self.x_test_densenet, y_test)
-            print("\n[FASE 1] Treinando com camadas congeladas (5 épocas)...")
-            sys.stdout.flush()
+            messagebox.showinfo("DenseNet", "Treinando fase 1 (camadas congeladas, 5 épocas)...")
             history_phase1 = model.fit(
                 self.x_train_densenet, y_train,
                 validation_data=(self.x_val_densenet, y_val),
-                epochs=5, batch_size=8, verbose=2,
+                epochs=5, batch_size=8, verbose=1,
                 callbacks=[cb_test]
             )
-            print("[FASE 1] Concluída!")
 
             # Fine-tuning: descongela últimas N camadas
             ft_layers = 50
             for layer in base.layers[-ft_layers:]:
                 layer.trainable = True
             model.compile(optimizer=Adam(learning_rate=1e-4), loss='binary_crossentropy', metrics=['accuracy'])
-            print(f"\n[FASE 2] Fine-tuning - descongelando últimas {ft_layers} camadas (3 épocas)...")
-            sys.stdout.flush()
+            messagebox.showinfo("DenseNet", f"Fine-tuning (últimas {ft_layers} camadas, 3 épocas)...")
             history_phase2 = model.fit(
                 self.x_train_densenet, y_train,
                 validation_data=(self.x_val_densenet, y_val),
-                epochs=3, batch_size=8, verbose=2,
+                epochs=3, batch_size=8, verbose=1,
                 callbacks=[cb_test]
             )
-            print("[FASE 2] Fine-tuning concluído!")
 
             # Mescla históricos
             merged_history = {}
@@ -1102,19 +1008,11 @@ class AlzheimerAnalysisGUI:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
         try:
-            print("\n=== INICIANDO TREINAMENTO DENSENET REGRESSÃO ===")
-            sys.stdout.flush()
             x_train, _, y_train_age = self.train_data
             x_val, _, y_val_age = self.val_data
-            
-            print("Preparando imagens para DenseNet regressão (224x224x3)...")
-            sys.stdout.flush()
+            messagebox.showinfo("DenseNet", "Preparando imagens para regressão...")
             self.x_train_densenet_reg = self._prepare_images_densenet(x_train)
-            print(f"  - Treino: {self.x_train_densenet_reg.shape}")
             self.x_val_densenet_reg = self._prepare_images_densenet(x_val)
-            print(f"  - Validação: {self.x_val_densenet_reg.shape}")
-            
-            print("\nConstruindo modelo DenseNet121 (regressão)...")
             base = DenseNet121(weights='imagenet', include_top=False, input_shape=(224,224,3))
             for layer in base.layers:
                 layer.trainable = False
@@ -1125,11 +1023,7 @@ class AlzheimerAnalysisGUI:
             out = Dense(1, activation='linear')(x)
             model = Model(inputs=base.input, outputs=out)
             model.compile(optimizer=Adam(learning_rate=1e-3), loss='mse', metrics=['mae'])
-            
-            print("\nTreinando DenseNet regressão (5 épocas)...")
-            sys.stdout.flush()
-            history = model.fit(self.x_train_densenet_reg, y_train_age, validation_data=(self.x_val_densenet_reg, y_val_age), epochs=5, batch_size=8, verbose=2)
-            print("Treinamento concluído!")
+            history = model.fit(self.x_train_densenet_reg, y_train_age, validation_data=(self.x_val_densenet_reg, y_val_age), epochs=5, batch_size=8, verbose=1)
             self.densenet_regress = model
             self.densenet_regress_history = history
             # Curvas
@@ -1223,10 +1117,240 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Falha na avaliação DenseNet Regressão:\n{str(e)}")
 
     # =========================================================================
-    # SEGMENTAÇÃO VENTRÍCULOS (K-Means simples)
+    # FUNÇÃO DE IDENTIFICAÇÃO DE VENTRÍCULOS (Completa)
+    # =========================================================================
+    def identify_ventricles(self, x_train_img, idx=0, debug_plots=True):
+        """
+        Identifies the ventricles on a brain slice as:
+        'the largest dark object inside the brain'.
+
+        Returns
+        -------
+        ventricle_mask : np.ndarray
+            Binary mask of ventricle contour (0/1).
+        label_img : np.ndarray
+            k-means label image (clusters 0..k-1).
+        centers : np.ndarray
+            k-means cluster centers (intensity).
+        features : dict
+            Shape descriptors:
+            area, perimeter, circularity, eccentricity,
+            solidity, extent, mean_intensity.
+        """
+
+        # -------------------------------
+        # 1. Pick image and normalize
+        # -------------------------------
+        if x_train_img.ndim == 3:
+            img = x_train_img[idx].astype(np.float32)   # (H, W)
+        else:
+            img = x_train_img.astype(np.float32)
+
+        h, w = img.shape
+
+        # Normalize to 0–255 for OpenCV ops
+        img_norm = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+        if debug_plots:
+            fig = Figure(figsize=(5, 5), dpi=100)
+            ax = fig.add_subplot(111)
+            ax.imshow(img_norm, cmap='gray')
+            ax.set_title("Original slice (normalized)")
+            ax.axis("off")
+            self.show_plot_main(fig)
+
+        # -------------------------------
+        # 2. Gaussian denoising
+        # -------------------------------
+        img_denoised = cv2.GaussianBlur(img_norm, (5, 5), sigmaX=1)
+
+        if debug_plots:
+            fig = Figure(figsize=(5, 5), dpi=100)
+            ax = fig.add_subplot(111)
+            ax.imshow(img_denoised, cmap='gray')
+            ax.set_title("After Gaussian blur")
+            ax.axis("off")
+            self.show_plot_main(fig)
+
+        # -------------------------------
+        # 3. K-means on intensities
+        #    (dark vs bright)
+        # -------------------------------
+        pixels = img_denoised.reshape((-1, 1)).astype(np.float32)
+
+        criteria = (
+            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+            100,
+            0.85
+        )
+
+        k = 2  # dark cluster vs bright cluster
+        compactness, labels, centers = cv2.kmeans(
+            pixels,
+            k,
+            None,
+            criteria,
+            10,
+            cv2.KMEANS_RANDOM_CENTERS
+        )
+
+        centers = centers.flatten()  # shape (k,)
+        # darkest cluster index (ventricles + dark stuff)
+        dark_cluster_id = np.argmin(centers)
+
+        # Label image: each pixel has cluster id 0..k-1
+        label_img = labels.reshape((h, w))
+
+        # Binary mask for dark cluster
+        dark_mask = (label_img == dark_cluster_id).astype(np.uint8)
+
+        if debug_plots:
+            fig = Figure(figsize=(5, 5), dpi=100)
+            ax = fig.add_subplot(111)
+            ax.imshow(dark_mask, cmap='gray')
+            ax.set_title("Dark cluster mask (k-means)")
+            ax.axis("off")
+            self.show_plot_main(fig)
+
+        # -------------------------------
+        # 4. Rough brain mask via Otsu
+        #    (to avoid outside background)
+        # -------------------------------
+        _, brain_bin = cv2.threshold(
+            img_denoised, 0, 255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        brain_mask = (brain_bin > 0).astype(np.uint8)
+
+        # bounding box of brain to constrain candidates
+        x, y, w_b, h_b = cv2.boundingRect(brain_bin)
+
+        if debug_plots:
+            fig = Figure(figsize=(5, 5), dpi=100)
+            ax = fig.add_subplot(111)
+            ax.imshow(brain_mask, cmap='gray')
+            ax.set_title("Brain mask (Otsu)")
+            ax.axis("off")
+            self.show_plot_main(fig)
+
+        # -------------------------------
+        # 5. Restrict dark cluster to brain region
+        # -------------------------------
+        candidate_mask = np.zeros_like(dark_mask)
+        candidate_mask[y:y + h_b, x:x + w_b] = dark_mask[y:y + h_b, x:x + w_b]
+
+        # Small morphological cleanup (optional)
+        kernel = np.ones((3, 3), np.uint8)
+        candidate_mask = cv2.morphologyEx(candidate_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        if debug_plots:
+            fig = Figure(figsize=(5, 5), dpi=100)
+            ax = fig.add_subplot(111)
+            ax.imshow(candidate_mask, cmap='gray')
+            ax.set_title("Dark mask restricted to brain")
+            ax.axis("off")
+            self.show_plot_main(fig)
+
+        # -------------------------------
+        # 6. Connected components:
+        #    largest dark object inside brain = ventricle
+        # -------------------------------
+        num_labels, cc_labels, stats, centroids = cv2.connectedComponentsWithStats(
+            candidate_mask, connectivity=8
+        )
+
+        ventricle_mask = np.zeros_like(candidate_mask, dtype=np.uint8)
+
+        # inicializa descritores
+        max_area = 0.0
+        perimeter = 0.0
+        circularity = np.nan
+        eccentricity = np.nan
+        solidity = np.nan
+        extent = np.nan
+        mean_intensity = np.nan
+
+        ventricle_label = -1
+
+        # label 0 is background
+        for lab in range(1, num_labels):
+            area = stats[lab, cv2.CC_STAT_AREA]
+            cx, cy = centroids[lab]
+
+            # Check if centroid is inside brain bounding box
+            if (x <= cx <= x + w_b) and (y <= cy <= y + h_b):
+                if area > max_area:
+                    max_area = float(area)
+                    ventricle_label = lab
+
+        if ventricle_label > 0:
+            # Cria máscara cheia para o ventrículo
+            ventricle_mask_full = (cc_labels == ventricle_label).astype(np.uint8)
+
+            # Contorno via dilatação - original
+            kernel = np.ones((3, 3), np.uint8)
+            dilated = cv2.dilate(ventricle_mask_full, kernel, iterations=1)
+            ventricle_contour = (dilated - ventricle_mask_full)
+            perimeter = float(np.sum(ventricle_contour))
+
+            # Circularidade: 4πA / P²
+            circularity = (4.0 * np.pi * max_area) / (perimeter ** 2 + 1e-8)
+
+            # regionprops para descritores de forma
+            labeled = label(ventricle_mask_full)
+            regions = regionprops(labeled, intensity_image=img_norm)
+
+            if len(regions) > 0:
+                r = regions[0]
+                eccentricity  = float(r.eccentricity)
+                solidity      = float(r.solidity)
+                extent        = float(r.extent)
+                mean_intensity = float(r.mean_intensity)
+
+            # Salva contorno final na máscara original
+            ventricle_mask[ventricle_contour == 1] = 1
+
+        # monta dicionário de descritores
+        features = {
+            "area": max_area,
+            "perimeter": perimeter,
+            "circularity": circularity,
+            "eccentricity": eccentricity,
+            "solidity": solidity,
+            "extent": extent,
+            "mean_intensity": mean_intensity,
+        }
+
+        if debug_plots:
+            fig = Figure(figsize=(5, 5), dpi=100)
+            ax = fig.add_subplot(111)
+            ax.imshow(ventricle_mask, cmap='gray')
+            ax.set_title(
+                f"Ventricle mask\n"
+                f"area={max_area:.1f}, P={perimeter:.1f}, circ={circularity:.3f}\n"
+                f"ecc={eccentricity:.3f}, sol={solidity:.3f}, ext={extent:.3f}"
+            )
+            ax.axis("off")
+            self.show_plot_main(fig)
+
+            overlay = cv2.cvtColor(img_norm, cv2.COLOR_GRAY2BGR)
+            overlay[ventricle_mask == 1] = [255, 0, 0]  # red ventricle
+
+            fig2 = Figure(figsize=(5, 5), dpi=100)
+            ax2 = fig2.add_subplot(111)
+            ax2.imshow(overlay)
+            ax2.set_title("Ventricle classification (red)")
+            ax2.axis("off")
+            self.show_plot_main(fig2)
+
+        # máscara, labels do k-means, centers e descritores
+        return ventricle_mask, label_img, centers, features
+
+    # =========================================================================
+    # SEGMENTAÇÃO VENTRÍCULOS (Interface - usa identify_ventricles)
     # =========================================================================
     def segmentar_ventriculos(self):
-        """Segmenta ventrículos na fatia atual usando K-means (k=2) heurístico."""
+        """Segmenta ventrículos na fatia atual usando método avançado identify_ventricles."""
         if self.current_image_data is None:
             messagebox.showwarning("Aviso", "Carregue uma imagem primeiro!")
             return
@@ -1236,40 +1360,25 @@ class AlzheimerAnalysisGUI:
                 slice_data = ImageLoader.get_slice(self.current_image_data, self.current_axis, self.current_slice_index)
             else:
                 slice_data = self.current_image_data
-            try:
-                import cv2
-            except ImportError:
-                messagebox.showerror("Erro", "OpenCV não instalado. Execute: pip install opencv-python")
-                return
-            img = slice_data.astype(np.float32)
-            # Normaliza
-            mn, mx = img.min(), img.max()
-            if mx > mn:
-                img_n = (img - mn)/(mx-mn)
-            else:
-                img_n = np.zeros_like(img)
-            img_blur = cv2.GaussianBlur(img_n, (5,5), 1)
-            pixels = img_blur.reshape((-1,1)).astype(np.float32)
-            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.85)
-            _, labels, centers = cv2.kmeans(pixels, 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-            centers = centers.ravel()
-            # Assume ventrículos = cluster mais claro
-            ventr_cluster = np.argmax(centers)
-            mask = (labels.reshape(img_blur.shape) == ventr_cluster)
-            # Limpa máscara
-            mask = cv2.medianBlur(mask.astype(np.uint8), 5)
-            # Figura
-            fig = Figure(figsize=(8,4), dpi=100)
-            ax1 = fig.add_subplot(121)
-            ax2 = fig.add_subplot(122)
-            ax1.imshow(img_n, cmap='gray'); ax1.set_title('Fatia Original'); ax1.axis('off')
-            overlay = np.dstack([np.zeros_like(img_n), np.zeros_like(img_n), np.zeros_like(img_n)])
-            overlay[mask] = [1,0,0]
-            ax2.imshow(img_n, cmap='gray')
-            ax2.imshow(overlay, alpha=0.4)
-            ax2.set_title('Ventrículos (Heurístico)'); ax2.axis('off')
-            fig.tight_layout()
-            self.show_plot_main(fig)
+            
+            # Chama função avançada de identificação de ventrículos
+            ventricle_mask, label_img, centers, features = self.identify_ventricles(
+                slice_data, idx=0, debug_plots=True
+            )
+            
+            # Exibe features extraídas
+            info_text = (
+                f"Características dos Ventrículos:\n\n"
+                f"Área: {features['area']:.1f} pixels\n"
+                f"Perímetro: {features['perimeter']:.1f}\n"
+                f"Circularidade: {features['circularity']:.3f}\n"
+                f"Excentricidade: {features['eccentricity']:.3f}\n"
+                f"Solidez: {features['solidity']:.3f}\n"
+                f"Extensão: {features['extent']:.3f}\n"
+                f"Intensidade Média: {features['mean_intensity']:.1f}"
+            )
+            messagebox.showinfo("Análise de Ventrículos", info_text)
+            
         except Exception as e:
             messagebox.showerror("Erro", f"Falha na segmentação:\n{str(e)}")
 
