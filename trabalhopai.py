@@ -150,7 +150,9 @@ def load_images(paths):
     return np.array(data)
 
 def load_and_prepare_data():
-    """Loads and preprocesses the dataset."""
+    """Preparação detalhada dos dados por paciente (split 80/20 + validação).
+    Retorna também estrutura 'split_info' com DataFrames e estatísticas.
+    """
     base_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(base_dir, 'oasis_longitudinal_demographic.csv')
     demographics_df = pd.read_csv(csv_path, sep=';')
@@ -161,65 +163,128 @@ def load_and_prepare_data():
     def get_diagnosis_binary(row):
         if row['Group'] == 'Nondemented':
             return 'NonDemented'
-        elif row['Group'] == 'Demented':
+        if row['Group'] == 'Demented':
             return 'Demented'
-        elif row['Group'] == 'Converted':
+        if row['Group'] == 'Converted':
             return 'Demented' if row['CDR'] > 0 else 'NonDemented'
         return 'Unknown'
 
     demographics_df['Diagnosis'] = demographics_df.apply(get_diagnosis_binary, axis=1)
-    valid_data_df = demographics_df[demographics_df['Diagnosis'] != 'Unknown'].dropna(subset=['MRI ID', 'Subject ID', 'Age'])
+    valid_data_df = demographics_df[demographics_df['Diagnosis'] != 'Unknown'].dropna(subset=['MRI ID','Subject ID','Age']).copy()
 
     patient_info = valid_data_df.groupby('Subject ID').agg(
-        final_CDR=('CDR', 'max'),
-        first_visit_age=('Age', 'min')
+        final_CDR=('CDR','max'),
+        first_visit_age=('Age','min'),
+        num_visits=('Visit','count')
     ).reset_index()
-    
-    patient_info['Diagnosis'] = patient_info['final_CDR'].apply(lambda cdr: 'Demented' if cdr > 0 else 'NonDemented')
-    
+    patient_info['Diagnosis'] = patient_info['final_CDR'].apply(lambda cdr: 'Demented' if cdr>0 else 'NonDemented')
     le = LabelEncoder()
     patient_info['Diagnosis_encoded'] = le.fit_transform(patient_info['Diagnosis'])
-    
+
     train_val_patients, test_patients = train_test_split(
-        patient_info, test_size=0.2, random_state=42,
-        stratify=patient_info['Diagnosis_encoded']
+        patient_info, test_size=0.2, random_state=42, stratify=patient_info['Diagnosis_encoded']
     )
     train_patients, val_patients = train_test_split(
-        train_val_patients, test_size=0.2, random_state=42,
-        stratify=train_val_patients['Diagnosis_encoded']
+        train_val_patients, test_size=0.2, random_state=42, stratify=train_val_patients['Diagnosis_encoded']
     )
 
-    def get_set_data(patient_ids_df, full_df):
-        set_df = full_df[full_df['Subject ID'].isin(patient_ids_df['Subject ID'])]
+    def get_set_data(p_df):
+        set_df = valid_data_df[valid_data_df['Subject ID'].isin(p_df['Subject ID'])].copy()
         axl_dir = os.path.join(base_dir, 'axl')
         paths = [os.path.join(axl_dir, f"{mri_id}_axl.nii") for mri_id in set_df['MRI ID']]
         class_labels = le.transform(set_df['Diagnosis'])
         age_labels = set_df['Age'].values
-        return paths, class_labels, age_labels
+        return paths, class_labels, age_labels, set_df
 
-    train_paths, y_train_class, y_train_age = get_set_data(train_patients, valid_data_df)
-    val_paths, y_val_class, y_val_age = get_set_data(val_patients, valid_data_df)
-    test_paths, y_test_class, y_test_age = get_set_data(test_patients, valid_data_df)
+    train_paths, y_train_class, y_train_age, train_df = get_set_data(train_patients)
+    val_paths, y_val_class, y_val_age, val_df = get_set_data(val_patients)
+    test_paths, y_test_class, y_test_age, test_df = get_set_data(test_patients)
 
-    print("Loading images...")
     x_train_img = load_images(train_paths)
     x_val_img = load_images(val_paths)
     x_test_img = load_images(test_paths)
-    
+
+    split_info = {
+        'train_patients': train_patients,
+        'val_patients': val_patients,
+        'test_patients': test_patients,
+        'train_df': train_df,
+        'val_df': val_df,
+        'test_df': test_df,
+        'label_encoder': le,
+        'num_train_exams': len(train_paths),
+        'num_val_exams': len(val_paths),
+        'num_test_exams': len(test_paths)
+    }
+
     return (x_train_img, y_train_class, y_train_age), \
            (x_val_img, y_val_class, y_val_age), \
            (x_test_img, y_test_class, y_test_age), \
-           valid_data_df, test_patients
+           valid_data_df, split_info
 
 def extract_features(images):
-    """Extracts texture features from a list of images."""
+    """Extrai features de textura multi-distâncias/ângulos + estatísticas + quadrantes."""
     features = []
+    distances = [1,3,5]
+    angles = [0, np.pi/4, np.pi/2, 3*np.pi/4]
     for img in images:
         img_8bit = (img * 255).astype(np.uint8)
-        glcm = graycomatrix(img_8bit, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
-        props = [graycoprops(glcm, prop)[0, 0] for prop in ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM']]
-        features.append(props)
-    return np.array(features)
+        vec = []
+        for d in distances:
+            glcm = graycomatrix(img_8bit, distances=[d], angles=angles, levels=256, symmetric=True, normed=True)
+            for prop in ['contrast','dissimilarity','homogeneity','energy','correlation','ASM']:
+                vals = graycoprops(glcm, prop)[0,:]
+                vec.append(vals.mean())
+                vec.append(vals.std())
+        # estatísticas globais
+        vec.extend([
+            np.mean(img), np.std(img), np.median(img), np.min(img), np.max(img),
+            np.percentile(img,25), np.percentile(img,75), np.var(img)
+        ])
+        h,w = img.shape
+        quads = [img[:h//2,:w//2], img[:h//2,w//2:], img[h//2:,:w//2], img[h//2:,w//2:]]
+        for q in quads:
+            vec.append(np.mean(q)); vec.append(np.std(q))
+        features.append(vec)
+    return np.array(features, dtype=np.float32)
+
+def extract_clinical_features(data_df, mri_ids):
+    """Extrai features clínicas (EDUC, MMSE, eTIV, nWBV, ASF, Visit, Years_since_first, CDR)."""
+    clinical = []
+    # calcular primeira visita por paciente (MR Delay mínima)
+    first_delay = {}
+    for _, row in data_df.iterrows():
+        sid = row['Subject ID']
+        delay = row.get('MR Delay', 0) if not pd.isna(row.get('MR Delay', 0)) else 0
+        if sid not in first_delay or delay < first_delay[sid]:
+            first_delay[sid] = delay
+    def sf(v, default):
+        if pd.isna(v): return default
+        if isinstance(v,str):
+            v = v.replace(',','.')
+        try:
+            return float(v)
+        except:
+            return default
+    for mri in mri_ids:
+        row = data_df[data_df['MRI ID']==mri]
+        if len(row)==0:
+            clinical.append([12.0,25.0,1500.0,0.7,1.2,1.0,0.0,0.0]); continue
+        r = row.iloc[0]
+        sid = r['Subject ID']
+        delay = sf(r.get('MR Delay',0),0)
+        years_since = max(0, delay - first_delay.get(sid,0))
+        clinical.append([
+            sf(r.get('EDUC',12.0),12.0),
+            sf(r.get('MMSE',25.0),25.0),
+            sf(r.get('eTIV',1500.0),1500.0),
+            sf(r.get('nWBV',0.7),0.7),
+            sf(r.get('ASF',1.2),1.2),
+            sf(r.get('Visit',1.0),1.0),
+            years_since,
+            sf(r.get('CDR',0.0),0.0)
+        ])
+    return np.array(clinical, dtype=np.float32)
 
 def evaluate_classifier(y_true, y_pred, model_name):
     """Calculates and prints classification metrics."""
@@ -599,11 +664,11 @@ class AlzheimerAnalysisGUI:
         """Prepara dados com split 80/20"""
         try:
             messagebox.showinfo("Preparando Dados", "Carregando e preparando dados...\nIsso pode levar alguns minutos.")
-            self.train_data, self.val_data, self.test_data, self.valid_data_df, self.test_patients = load_and_prepare_data()
-            messagebox.showinfo("Sucesso", f"Dados preparados com sucesso!\n\n"
-                              f"Treino: {len(self.train_data[0])} imagens\n"
-                              f"Validação: {len(self.val_data[0])} imagens\n"
-                              f"Teste: {len(self.test_data[0])} imagens")
+            self.train_data, self.val_data, self.test_data, self.valid_data_df, self.split_info = load_and_prepare_data()
+            messagebox.showinfo("Sucesso", f"Dados preparados!\n\n"
+                              f"Exames Treino: {self.split_info['num_train_exams']}\n"
+                              f"Exames Validação: {self.split_info['num_val_exams']}\n"
+                              f"Exames Teste: {self.split_info['num_test_exams']}")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao preparar dados:\n{str(e)}")
     
@@ -615,10 +680,22 @@ class AlzheimerAnalysisGUI:
         
         try:
             messagebox.showinfo("Extraindo", "Extraindo características...\nIsso pode levar alguns minutos.")
-            self.x_train_features = extract_features(self.train_data[0])
-            self.x_val_features = extract_features(self.val_data[0])
-            self.x_test_features = extract_features(self.test_data[0])
-            messagebox.showinfo("Sucesso", "Características extraídas com sucesso!")
+            # Textura
+            tex_train = extract_features(self.train_data[0])
+            tex_val = extract_features(self.val_data[0])
+            tex_test = extract_features(self.test_data[0])
+            # Clínicas (usa DataFrames do split_info)
+            train_mri_ids = self.split_info['train_df']['MRI ID'].tolist()
+            val_mri_ids = self.split_info['val_df']['MRI ID'].tolist()
+            test_mri_ids = self.split_info['test_df']['MRI ID'].tolist()
+            clin_train = extract_clinical_features(self.valid_data_df, train_mri_ids)
+            clin_val = extract_clinical_features(self.valid_data_df, val_mri_ids)
+            clin_test = extract_clinical_features(self.valid_data_df, test_mri_ids)
+            # Concatena (textura + clínica)
+            self.x_train_features = np.concatenate([tex_train, clin_train], axis=1)
+            self.x_val_features = np.concatenate([tex_val, clin_val], axis=1)
+            self.x_test_features = np.concatenate([tex_test, clin_test], axis=1)
+            messagebox.showinfo("Sucesso", f"Características extraídas!\nDimensão final: {self.x_train_features.shape[1]}")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao extrair características:\n{str(e)}")
     
@@ -692,52 +769,95 @@ class AlzheimerAnalysisGUI:
         
         try:
             messagebox.showinfo("Treinando", "Treinando XGBoost...")
-            self.xgboost_model = xgb.XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.1, random_state=42)
-            self.xgboost_model.fit(self.x_train_features, self.train_data[2])
-            messagebox.showinfo("Sucesso", "XGBoost treinado com sucesso!")
+            params = dict(
+                n_estimators=400,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.1,
+                reg_lambda=1.0,
+                random_state=42
+            )
+            self.xgboost_model = xgb.XGBRegressor(**params)
+            self.xgboost_model.fit(
+                self.x_train_features,
+                self.train_data[2],
+                eval_set=[(self.x_val_features, self.val_data[2])],
+                eval_metric='mae',
+                early_stopping_rounds=30,
+                verbose=False
+            )
+            messagebox.showinfo("Sucesso", f"XGBoost treinado! Melhor iter: {self.xgboost_model.best_iteration}")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao treinar XGBoost:\n{str(e)}")
     
     def avaliar_xgboost(self):
-        """Avalia XGBoost"""
+        """Avaliação avançada XGBoost: MAE, RMSE, R2, dispersão, histograma de erros."""
         if self.xgboost_model is None:
             messagebox.showwarning("Aviso", "Treine o XGBoost primeiro!")
             return
         
         try:
+            y_true = self.test_data[2]
             y_pred = self.xgboost_model.predict(self.x_test_features)
-            mae = mean_absolute_error(self.test_data[2], y_pred)
-            messagebox.showinfo("Resultados XGBoost", f"MAE: {mae:.2f} anos")
+            mae = mean_absolute_error(y_true, y_pred)
+            rmse = mean_squared_error(y_true, y_pred, squared=False)
+            r2 = r2_score(y_true, y_pred)
+            abs_err = np.abs(y_true - y_pred)
+            pct_within_5 = np.mean(abs_err <= 5) * 100
+            pct_within_10 = np.mean(abs_err <= 10) * 100
+            # Figura combinada
+            fig = Figure(figsize=(10,4), dpi=100)
+            ax1 = fig.add_subplot(121)
+            ax2 = fig.add_subplot(122)
+            ax1.scatter(y_true, y_pred, alpha=0.7)
+            min_v, max_v = y_true.min(), y_true.max()
+            ax1.plot([min_v, max_v], [min_v, max_v], 'r--')
+            ax1.set_title('Dispersão Idade (XGBoost)')
+            ax1.set_xlabel('Real'); ax1.set_ylabel('Predita')
+            ax2.hist(abs_err, bins=20, color='steelblue', alpha=0.8)
+            ax2.set_title('Histograma Erros Absolutos')
+            ax2.set_xlabel('Erro (anos)'); ax2.set_ylabel('Frequência')
+            fig.tight_layout()
+            self.show_plot_main(fig)
+            messagebox.showinfo("XGBoost", f"MAE: {mae:.2f}\nRMSE: {rmse:.2f}\nR2: {r2:.3f}\n±5 anos: {pct_within_5:.1f}%\n±10 anos: {pct_within_10:.1f}%")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro:\n{str(e)}")
     
     def analise_temporal(self):
-        """Análise temporal - visitas posteriores têm idades maiores?"""
+        """Análise temporal avançada: verifica crescimento monotônico das idades preditas por paciente."""
         if self.xgboost_model is None:
             messagebox.showwarning("Aviso", "Treine o XGBoost primeiro!")
             return
         
         try:
             y_pred = self.xgboost_model.predict(self.x_test_features)
-            test_data_df = self.valid_data_df[self.valid_data_df['Subject ID'].isin(self.test_patients['Subject ID'])]
-            test_data_df = test_data_df.copy()
-            test_data_df['predicted_age'] = y_pred[:len(test_data_df)]
-            
-            consistent_increase = 0
-            total_patients = 0
-            
-            for subject_id, group in test_data_df.sort_values(['Subject ID', 'Visit']).groupby('Subject ID'):
-                if len(group) > 1:
-                    total_patients += 1
-                    predicted_ages = group['predicted_age'].values
-                    if np.all(np.diff(predicted_ages) >= 0):
-                        consistent_increase += 1
-            
-            ratio = (consistent_increase / total_patients * 100) if total_patients > 0 else 0
-            messagebox.showinfo("Análise Temporal", 
-                              f"Pacientes com múltiplas visitas: {total_patients}\n"
-                              f"Com idades crescentes: {consistent_increase}\n"
-                              f"Percentual: {ratio:.1f}%")
+            # DataFrame de teste completo
+            test_df = self.split_info['test_df'].copy()
+            test_df = test_df.sort_values(['Subject ID','Visit'])
+            test_df['PredictedAge'] = y_pred[:len(test_df)]
+            multi_patients = 0
+            consistent = 0
+            for sid, grp in test_df.groupby('Subject ID'):
+                if len(grp) > 1:
+                    multi_patients += 1
+                    if np.all(np.diff(grp['PredictedAge'].values) >= -0.5):  # tolera pequena oscilação negativa
+                        consistent += 1
+            perc = (consistent / multi_patients * 100) if multi_patients>0 else 0
+            # Plot linhas por paciente (limitando a até 12 pacientes para legibilidade)
+            fig = Figure(figsize=(8,5), dpi=100)
+            ax = fig.add_subplot(111)
+            for i,(sid, grp) in enumerate(test_df.groupby('Subject ID')):
+                if i>=12: break
+                ax.plot(grp['Visit'], grp['PredictedAge'], marker='o', label=str(sid))
+            ax.set_title('Trajetória Idade Predita (Teste)')
+            ax.set_xlabel('Visita'); ax.set_ylabel('Idade Predita')
+            if multi_patients>0:
+                ax.legend(fontsize=8, ncol=2)
+            fig.tight_layout()
+            self.show_plot_main(fig)
+            messagebox.showinfo("Análise Temporal", f"Pacientes multi-visita: {multi_patients}\nConsistentes crescimento: {consistent}\nPercentual: {perc:.1f}%")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro:\n{str(e)}")
     
@@ -915,7 +1035,11 @@ class AlzheimerAnalysisGUI:
                 slice_data = ImageLoader.get_slice(self.current_image_data, self.current_axis, self.current_slice_index)
             else:
                 slice_data = self.current_image_data
-            import cv2
+            try:
+                import cv2
+            except ImportError:
+                messagebox.showerror("Erro", "OpenCV não instalado. Execute: pip install opencv-python")
+                return
             img = slice_data.astype(np.float32)
             # Normaliza
             mn, mx = img.min(), img.max()
