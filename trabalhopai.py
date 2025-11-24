@@ -236,28 +236,83 @@ def plot_mri_image(mri_id):
     # OTHER CASES (rare)
     # -----------------------------
     raise ValueError(f"Unexpected MRI shape: {data.shape}")
+
+
+
+
+
+    import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+
+# ---------------------------
+# MAIN FUNCTION
+# ---------------------------
 def identify_ventricles(x_train_img):
-    
-    #turns each pixel into a row wich can have one gray value
-    pixel_vals_train = x_train_img.reshape((-1,1))
+    # pick one image
+    img = x_train_img[0].astype(np.float32)   # (H, W)
+    h, w = img.shape
+
+    # show original
     plt.figure(figsize=(6, 6))
-    plt.imshow(x_train_img[0], cmap='gray')
+    plt.imshow(img, cmap='gray')
+    plt.title("Original image")
     plt.axis("off")
     plt.show()
-   
-    pixel_vals_train = np.float32(pixel_vals_train)
-    
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.85)
 
-    k = 3
-    retval, labels, centers = cv2.kmeans(pixel_vals_train, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+    # ---------------------------------------
+    # APPLY GAUSSIAN NOISE REMOVAL
+    # ---------------------------------------
+    # kernel size (5,5) is standard for MRI noise
+    img_denoised = cv2.GaussianBlur(img, (5, 5), sigmaX=1)
 
+    plt.figure(figsize=(6, 6))
+    plt.imshow(img_denoised, cmap='gray')
+    plt.title("After Gaussian Noise Removal")
+    plt.axis("off")
+    plt.show()
+
+    # ---------------------------------------
+    # PREP FOR K-MEANS
+    # reshape to (H*W, 1)
+    # ---------------------------------------
+    pixel_vals_train = img_denoised.reshape((-1, 1)).astype(np.float32)
+
+    # ---------------------------------------
+    # K-MEANS CLUSTERING
+    # ---------------------------------------
+    criteria = (
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+        100,
+        0.85
+    )
+
+    k = 2
+    retval, labels, centers = cv2.kmeans(
+        pixel_vals_train,
+        k,
+        None,
+        criteria,
+        10,
+        cv2.KMEANS_RANDOM_CENTERS
+    )
+
+    # convert cluster centers to grayscale 0–255
     centers = np.uint8(centers)
+
+    # replace pixels with their cluster center
     segmented_data = centers[labels.flatten()]
+    segmented_image = segmented_data.reshape((h, w))
 
-    segmented_image = segmented_data.reshape((pixel_vals_train.shape))
+    # show segmented image
+    plt.figure(figsize=(6, 6))
+    plt.imshow(segmented_image, cmap='gray')
+    plt.title(f"K-means segmented image (k={k})")
+    plt.axis("off")
+    plt.show()
 
-    plt.imshow(segmented_image)
+    return segmented_image
+
 
 
 
