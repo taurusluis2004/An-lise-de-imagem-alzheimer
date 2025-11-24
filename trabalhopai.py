@@ -6,6 +6,7 @@
 # =============================================================================
 import numpy as np 
 import os
+import sys
 import pandas as pd 
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -27,6 +28,9 @@ from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D
 from tensorflow.keras.applications import DenseNet121
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import Callback
+
+# Força flush automático para ver prints em tempo real
+sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
 
 # =============================================================================
 # CALLBACK CUSTOMIZADO PARA TESTE
@@ -170,14 +174,25 @@ def load_images(paths):
 
 def load_and_prepare_data():
     """Preparação detalhada dos dados por paciente (split 80/20 + validação).
+    Usa oasis_longitudinal_demographic.csv como base demográfica.
     Retorna também estrutura 'split_info' com DataFrames e estatísticas.
     """
     base_dir = os.path.dirname(os.path.abspath(__file__))
+    # CSV demográfico original para classificação
     csv_path = os.path.join(base_dir, 'oasis_longitudinal_demographic.csv')
     demographics_df = pd.read_csv(csv_path, sep=';')
     demographics_df['CDR'] = demographics_df['CDR'].astype(str).str.replace(',', '.', regex=False)
     demographics_df['CDR'] = pd.to_numeric(demographics_df['CDR'], errors='coerce')
     demographics_df['Age'] = pd.to_numeric(demographics_df['Age'], errors='coerce')
+    
+    # Carrega planilha.csv para features morfológicas (usado em regressão)
+    planilha_path = os.path.join(base_dir, 'planilha.csv')
+    planilha_df = pd.read_csv(planilha_path)
+    # Normaliza colunas numéricas da planilha
+    for col in ['CDR', 'Age', 'area', 'perimeter', 'circularity', 'eccentricity', 'solidity', 'extent', 'mean_intensity']:
+        if col in planilha_df.columns:
+            planilha_df[col] = planilha_df[col].astype(str).str.replace(',', '.', regex=False)
+            planilha_df[col] = pd.to_numeric(planilha_df[col], errors='coerce')
 
     def get_diagnosis_binary(row):
         if row['Group'] == 'Nondemented':
@@ -233,7 +248,8 @@ def load_and_prepare_data():
         'label_encoder': le,
         'num_train_exams': len(train_paths),
         'num_val_exams': len(val_paths),
-        'num_test_exams': len(test_paths)
+        'num_test_exams': len(test_paths),
+        'planilha_df': planilha_df  # Adiciona planilha para uso em regressão
     }
 
     return (x_train_img, y_train_class, y_train_age), \
@@ -266,6 +282,34 @@ def extract_features(images):
             vec.append(np.mean(q)); vec.append(np.std(q))
         features.append(vec)
     return np.array(features, dtype=np.float32)
+
+def extract_morphological_features(data_df, mri_ids):
+    """Extrai features morfológicas (area, perimeter, circularity, etc.) da planilha."""
+    morpho = []
+    def sf(v, default):
+        if pd.isna(v): return default
+        if isinstance(v,str):
+            v = v.replace(',','.')
+        try:
+            return float(v)
+        except:
+            return default
+    for mri in mri_ids:
+        row = data_df[data_df['MRI ID']==mri]
+        if len(row)==0:
+            # Defaults se registro não encontrado
+            morpho.append([1000.0, 300.0, 0.15, 0.7, 0.6, 0.4, 30.0]); continue
+        r = row.iloc[0]
+        morpho.append([
+            sf(r.get('area', 1000.0), 1000.0),
+            sf(r.get('perimeter', 300.0), 300.0),
+            sf(r.get('circularity', 0.15), 0.15),
+            sf(r.get('eccentricity', 0.7), 0.7),
+            sf(r.get('solidity', 0.6), 0.6),
+            sf(r.get('extent', 0.4), 0.4),
+            sf(r.get('mean_intensity', 30.0), 30.0)
+        ])
+    return np.array(morpho, dtype=np.float32)
 
 def extract_clinical_features(data_df, mri_ids):
     """Extrai features clínicas (EDUC, MMSE, eTIV, nWBV, ASF, Visit, Years_since_first, CDR)."""
@@ -398,7 +442,9 @@ class AlzheimerAnalysisGUI:
         # Menu Dados
         menu_dados = tk.Menu(menu_bar, tearoff=0)
         menu_dados.add_command(label="Preparar Dados (80/20)", command=self.preparar_dados)
-        menu_dados.add_command(label="Extrair Características", command=self.extrair_caracteristicas)
+        menu_dados.add_separator()
+        menu_dados.add_command(label="Extrair Características (Classificação)", command=self.extrair_caracteristicas)
+        menu_dados.add_command(label="Extrair Características (Regressão)", command=self.extrair_caracteristicas_regressao)
         menu_bar.add_cascade(label="Dados", menu=menu_dados)
         
         # Menu SVM
@@ -692,29 +738,68 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Erro ao preparar dados:\n{str(e)}")
     
     def extrair_caracteristicas(self):
-        """Extrai características GLCM das imagens"""
+        """Extrai características para CLASSIFICAÇÃO (SVM): textura + clínicas do OASIS"""
         if self.train_data is None:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
         
         try:
-            messagebox.showinfo("Extraindo", "Extraindo características...\nIsso pode levar alguns minutos.")
-            # Textura
+            messagebox.showinfo("Extraindo", "Extraindo características para CLASSIFICAÇÃO...\nIsso pode levar alguns minutos.")
+            # Textura das imagens
             tex_train = extract_features(self.train_data[0])
             tex_val = extract_features(self.val_data[0])
             tex_test = extract_features(self.test_data[0])
-            # Clínicas (usa DataFrames do split_info)
+            
+            # Clínicas do OASIS (sem features morfológicas para classificação)
             train_mri_ids = self.split_info['train_df']['MRI ID'].tolist()
             val_mri_ids = self.split_info['val_df']['MRI ID'].tolist()
             test_mri_ids = self.split_info['test_df']['MRI ID'].tolist()
             clin_train = extract_clinical_features(self.valid_data_df, train_mri_ids)
             clin_val = extract_clinical_features(self.valid_data_df, val_mri_ids)
             clin_test = extract_clinical_features(self.valid_data_df, test_mri_ids)
-            # Concatena (textura + clínica)
+            
+            # Concatena APENAS textura + clínica (SEM morfológicas)
             self.x_train_features = np.concatenate([tex_train, clin_train], axis=1)
             self.x_val_features = np.concatenate([tex_val, clin_val], axis=1)
             self.x_test_features = np.concatenate([tex_test, clin_test], axis=1)
-            messagebox.showinfo("Sucesso", f"Características extraídas!\nDimensão final: {self.x_train_features.shape[1]}")
+            
+            messagebox.showinfo("Sucesso", f"Características para CLASSIFICAÇÃO extraídas!\nDimensão: {self.x_train_features.shape[1]} (textura + clínicas OASIS)")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao extrair características:\n{str(e)}")
+    
+    def extrair_caracteristicas_regressao(self):
+        """Extrai características para REGRESSÃO (XGBoost): textura + morfológicas + clínicas"""
+        if self.train_data is None:
+            messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
+            return
+        
+        try:
+            messagebox.showinfo("Extraindo", "Extraindo características para REGRESSÃO...\nIsso pode levar alguns minutos.")
+            # Textura das imagens
+            tex_train = extract_features(self.train_data[0])
+            tex_val = extract_features(self.val_data[0])
+            tex_test = extract_features(self.test_data[0])
+            
+            # Morfológicas da PLANILHA.CSV
+            train_mri_ids = self.split_info['train_df']['MRI ID'].tolist()
+            val_mri_ids = self.split_info['val_df']['MRI ID'].tolist()
+            test_mri_ids = self.split_info['test_df']['MRI ID'].tolist()
+            planilha_df = self.split_info['planilha_df']
+            morph_train = extract_morphological_features(planilha_df, train_mri_ids)
+            morph_val = extract_morphological_features(planilha_df, val_mri_ids)
+            morph_test = extract_morphological_features(planilha_df, test_mri_ids)
+            
+            # Clínicas do OASIS
+            clin_train = extract_clinical_features(self.valid_data_df, train_mri_ids)
+            clin_val = extract_clinical_features(self.valid_data_df, val_mri_ids)
+            clin_test = extract_clinical_features(self.valid_data_df, test_mri_ids)
+            
+            # Concatena textura + morfológicas + clínica
+            self.x_train_features_reg = np.concatenate([tex_train, morph_train, clin_train], axis=1)
+            self.x_val_features_reg = np.concatenate([tex_val, morph_val, clin_val], axis=1)
+            self.x_test_features_reg = np.concatenate([tex_test, morph_test, clin_test], axis=1)
+            
+            messagebox.showinfo("Sucesso", f"Características para REGRESSÃO extraídas!\nDimensão: {self.x_train_features_reg.shape[1]} (textura + morfológicas PLANILHA + clínicas)")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao extrair características:\n{str(e)}")
     
@@ -781,13 +866,13 @@ class AlzheimerAnalysisGUI:
     # XGBOOST - REGRESSOR RASO
     # =========================================================================
     def treinar_xgboost(self):
-        """Treina XGBoost para regressão de idade"""
-        if self.x_train_features is None:
-            messagebox.showwarning("Aviso", "Extraia as características primeiro!")
+        """Treina XGBoost para regressão de idade usando features de REGRESSÃO"""
+        if not hasattr(self, 'x_train_features_reg') or self.x_train_features_reg is None:
+            messagebox.showwarning("Aviso", "Extraia as características de REGRESSÃO primeiro!\nUse: Dados → Extrair Características Regressão")
             return
         
         try:
-            messagebox.showinfo("Treinando", "Treinando XGBoost...")
+            messagebox.showinfo("Treinando", "Treinando XGBoost com features morfológicas...")
             params = dict(
                 n_estimators=400,
                 max_depth=6,
@@ -803,15 +888,15 @@ class AlzheimerAnalysisGUI:
             try:
                 # Tentativa com early stopping e eval_set (APIs mais novas)
                 self.xgboost_model.fit(
-                    self.x_train_features,
+                    self.x_train_features_reg,
                     self.train_data[2],
-                    eval_set=[(self.x_val_features, self.val_data[2])],
+                    eval_set=[(self.x_val_features_reg, self.val_data[2])],
                     early_stopping_rounds=30,
                     verbose=False
                 )
             except TypeError:
                 # Fallback para APIs antigas sem esses kwargs
-                self.xgboost_model.fit(self.x_train_features, self.train_data[2])
+                self.xgboost_model.fit(self.x_train_features_reg, self.train_data[2])
             # Recupera melhor iteração de forma robusta (difere por versão do XGBoost)
             best_iter = getattr(self.xgboost_model, 'best_iteration', None)
             if best_iter is None:
@@ -835,7 +920,7 @@ class AlzheimerAnalysisGUI:
         
         try:
             y_true = self.test_data[2]
-            y_pred = self.xgboost_model.predict(self.x_test_features)
+            y_pred = self.xgboost_model.predict(self.x_test_features_reg)
             mae = mean_absolute_error(y_true, y_pred)
             # Compatível com versões antigas do scikit-learn (sem parâmetro 'squared')
             rmse = np.sqrt(mean_squared_error(y_true, y_pred))
@@ -868,7 +953,7 @@ class AlzheimerAnalysisGUI:
             return
         
         try:
-            y_pred = self.xgboost_model.predict(self.x_test_features)
+            y_pred = self.xgboost_model.predict(self.x_test_features_reg)
             # DataFrame de teste completo
             test_df = self.split_info['test_df'].copy()
             test_df = test_df.sort_values(['Subject ID','Visit'])
@@ -922,13 +1007,20 @@ class AlzheimerAnalysisGUI:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
         try:
+            print("\n=== INICIANDO TREINAMENTO DENSENET CLASSIFICAÇÃO ===")
+            sys.stdout.flush()
             x_train, y_train, _ = self.train_data
             x_val, y_val, _ = self.val_data
             x_test, y_test, _ = self.test_data
-            messagebox.showinfo("DenseNet", "Preparando imagens para DenseNet...")
+            
+            print("Preparando imagens para DenseNet (224x224x3)...")
+            sys.stdout.flush()
             self.x_train_densenet = self._prepare_images_densenet(x_train)
+            print(f"  - Treino: {self.x_train_densenet.shape}")
             self.x_val_densenet = self._prepare_images_densenet(x_val)
+            print(f"  - Validação: {self.x_val_densenet.shape}")
             self.x_test_densenet = self._prepare_images_densenet(x_test)
+            print(f"  - Teste: {self.x_test_densenet.shape}")
 
             base = DenseNet121(weights='imagenet', include_top=False, input_shape=(224,224,3))
             for layer in base.layers:
@@ -943,26 +1035,30 @@ class AlzheimerAnalysisGUI:
             model.compile(optimizer=Adam(learning_rate=1e-3), loss='binary_crossentropy', metrics=['accuracy'])
 
             cb_test = TestAccuracyCallback(self.x_test_densenet, y_test)
-            messagebox.showinfo("DenseNet", "Treinando fase 1 (camadas congeladas, 5 épocas)...")
+            print("\n[FASE 1] Treinando com camadas congeladas (5 épocas)...")
+            sys.stdout.flush()
             history_phase1 = model.fit(
                 self.x_train_densenet, y_train,
                 validation_data=(self.x_val_densenet, y_val),
-                epochs=5, batch_size=8, verbose=1,
+                epochs=5, batch_size=8, verbose=2,
                 callbacks=[cb_test]
             )
+            print("[FASE 1] Concluída!")
 
             # Fine-tuning: descongela últimas N camadas
             ft_layers = 50
             for layer in base.layers[-ft_layers:]:
                 layer.trainable = True
             model.compile(optimizer=Adam(learning_rate=1e-4), loss='binary_crossentropy', metrics=['accuracy'])
-            messagebox.showinfo("DenseNet", f"Fine-tuning (últimas {ft_layers} camadas, 3 épocas)...")
+            print(f"\n[FASE 2] Fine-tuning - descongelando últimas {ft_layers} camadas (3 épocas)...")
+            sys.stdout.flush()
             history_phase2 = model.fit(
                 self.x_train_densenet, y_train,
                 validation_data=(self.x_val_densenet, y_val),
-                epochs=3, batch_size=8, verbose=1,
+                epochs=3, batch_size=8, verbose=2,
                 callbacks=[cb_test]
             )
+            print("[FASE 2] Fine-tuning concluído!")
 
             # Mescla históricos
             merged_history = {}
@@ -1006,11 +1102,19 @@ class AlzheimerAnalysisGUI:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
         try:
+            print("\n=== INICIANDO TREINAMENTO DENSENET REGRESSÃO ===")
+            sys.stdout.flush()
             x_train, _, y_train_age = self.train_data
             x_val, _, y_val_age = self.val_data
-            messagebox.showinfo("DenseNet", "Preparando imagens para regressão...")
+            
+            print("Preparando imagens para DenseNet regressão (224x224x3)...")
+            sys.stdout.flush()
             self.x_train_densenet_reg = self._prepare_images_densenet(x_train)
+            print(f"  - Treino: {self.x_train_densenet_reg.shape}")
             self.x_val_densenet_reg = self._prepare_images_densenet(x_val)
+            print(f"  - Validação: {self.x_val_densenet_reg.shape}")
+            
+            print("\nConstruindo modelo DenseNet121 (regressão)...")
             base = DenseNet121(weights='imagenet', include_top=False, input_shape=(224,224,3))
             for layer in base.layers:
                 layer.trainable = False
@@ -1021,7 +1125,11 @@ class AlzheimerAnalysisGUI:
             out = Dense(1, activation='linear')(x)
             model = Model(inputs=base.input, outputs=out)
             model.compile(optimizer=Adam(learning_rate=1e-3), loss='mse', metrics=['mae'])
-            history = model.fit(self.x_train_densenet_reg, y_train_age, validation_data=(self.x_val_densenet_reg, y_val_age), epochs=5, batch_size=8, verbose=1)
+            
+            print("\nTreinando DenseNet regressão (5 épocas)...")
+            sys.stdout.flush()
+            history = model.fit(self.x_train_densenet_reg, y_train_age, validation_data=(self.x_val_densenet_reg, y_val_age), epochs=5, batch_size=8, verbose=2)
+            print("Treinamento concluído!")
             self.densenet_regress = model
             self.densenet_regress_history = history
             # Curvas
