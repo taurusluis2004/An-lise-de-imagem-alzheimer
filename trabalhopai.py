@@ -426,6 +426,11 @@ class AlzheimerAnalysisGUI:
         menu_densenet.add_command(label="Avaliar Regressão", command=self.avaliar_densenet_regress)
         menu_densenet.add_command(label="Curvas Classificação", command=self.plot_curvas_densenet_classif)
         menu_bar.add_cascade(label="DenseNet", menu=menu_densenet)
+
+        # Menu Visualização
+        menu_vis = tk.Menu(menu_bar, tearoff=0)
+        menu_vis.add_command(label="Gráficos de Dispersão (planilha)", command=self.plot_scatter_matrix)
+        menu_bar.add_cascade(label="Visualização", menu=menu_vis)
         
         # Menu Acessibilidade
         menu_acess = tk.Menu(menu_bar, tearoff=0)
@@ -1115,6 +1120,57 @@ class AlzheimerAnalysisGUI:
             messagebox.showinfo("DenseNet Regressão", f"MAE: {mae:.2f}\nRMSE: {rmse:.2f}\nR2: {r2:.3f}")
         except Exception as e:
             messagebox.showerror("Erro", f"Falha na avaliação DenseNet Regressão:\n{str(e)}")
+
+    def plot_scatter_matrix(self):
+        """
+        Gera gráficos de dispersão (scatterplots) a partir de 'planilha.csv'.
+        Plota as características de segmentação aos pares, colorindo pela classe.
+        """
+        try:
+            messagebox.showinfo("Carregando", "Carregando dados da planilha e gerando gráficos...\nIsso pode levar um momento.")
+            
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            csv_path = os.path.join(base_dir, 'planilha.csv')
+
+            if not os.path.exists(csv_path):
+                messagebox.showerror("Erro", f"Arquivo 'planilha.csv' não encontrado no diretório:\n{base_dir}")
+                return
+
+            df = pd.read_csv(csv_path)
+
+            feature_cols = ['area', 'perimeter', 'circularity', 'eccentricity', 'solidity', 'extent', 'mean_intensity']
+            
+            # Garante que as colunas de features são numéricas, tratando vírgulas
+            for col in feature_cols:
+                if df[col].dtype == 'object':
+                    df[col] = df[col].str.replace(',', '.', regex=False)
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            df.dropna(subset=feature_cols, inplace=True)
+
+            if df.empty:
+                messagebox.showwarning("Aviso", "Não há dados válidos na planilha para gerar os gráficos.")
+                return
+
+            # Define a paleta de cores solicitada
+            color_palette = {
+                'Nondemented': 'blue',
+                'Demented': 'red',
+                'Converted': 'black'
+            }
+            
+            # Gera o pairplot com Seaborn, sem gráficos na diagonal
+            g = sns.pairplot(df, vars=feature_cols, hue='Group', palette=color_palette, plot_kws={'alpha': 0.6}, diag_kind=None)
+            
+            g.fig.suptitle("Gráficos de Dispersão por Classe", y=1.02) # Título acima do gráfico
+            
+            # Usa o helper para exibir o gráfico na aba 'Gráficos'
+            self.show_plot_main(g.fig)
+
+            messagebox.showinfo("Sucesso", "Gráficos de dispersão gerados na aba 'Gráficos'.")
+
+        except Exception as e:
+            messagebox.showerror("Erro", f"Ocorreu um erro ao gerar os gráficos:\n{str(e)}")
 
     # =========================================================================
     # FUNÇÃO DE IDENTIFICAÇÃO DE VENTRÍCULOS (Completa)
