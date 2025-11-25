@@ -57,7 +57,7 @@ class ImageLoader:
     @staticmethod
     def load_image(file_path):
         """
-        Carrega uma imagem de qualquer formato suportado.
+        Carrega uma imagem de qualquer formato suportado. 
         
         Args:
             file_path (str): Caminho para o arquivo de imagem
@@ -113,25 +113,6 @@ class ImageLoader:
         }
         
         return data, metadata
-    
-    @staticmethod
-    def get_slice(image_data, axis=2, slice_idx=None):
-        """Extrai uma fatia 2D de uma imagem 3D."""
-        if len(image_data.shape) == 2:
-            return image_data
-        
-        if len(image_data.shape) == 3:
-            if slice_idx is None:
-                slice_idx = image_data.shape[axis] // 2
-            
-            if axis == 0:
-                return image_data[slice_idx, :, :]
-            elif axis == 1:
-                return image_data[:, slice_idx, :]
-            elif axis == 2:
-                return image_data[:, :, slice_idx]
-        
-        raise ValueError(f"Não é possível extrair fatia de imagem com shape {image_data.shape}")
     
     @staticmethod
     def normalize_for_display(image_data):
@@ -384,8 +365,6 @@ class AlzheimerAnalysisGUI:
         # Variáveis de controle
         self.current_image_data = None
         self.current_metadata = None
-        self.current_slice_index = 0
-        self.current_axis = 2  # Axial
         self.zoom_level = 1.0
         
         # Dataset paths
@@ -480,7 +459,6 @@ class AlzheimerAnalysisGUI:
         # Menu Segmentação
         menu_seg = tk.Menu(menu_bar, tearoff=0)
         menu_seg.add_command(label="Segmentar Ventrículos", command=self.segmentar_ventriculos)
-        menu_seg.add_command(label="Mostrar Todas Fatias", command=self.exibir_todas_fatias)
         menu_bar.add_cascade(label="Segmentação", menu=menu_seg)
         
         self.root.config(menu=menu_bar)
@@ -509,18 +487,6 @@ class AlzheimerAnalysisGUI:
         
         self.lbl_dimensoes = ttk.Label(self.info_frame, text="Dimensões: -")
         self.lbl_dimensoes.pack(anchor=tk.W)
-        
-        # Controles de navegação
-        self.nav_frame = ttk.LabelFrame(self.painel_esquerdo, text="Navegação", padding=10)
-        self.nav_frame.pack(fill=tk.X, pady=10)
-        
-        ttk.Label(self.nav_frame, text="Fatia:").pack(anchor=tk.W, pady=(5, 0))
-        self.slice_slider = ttk.Scale(self.nav_frame, from_=0, to=100, orient=tk.HORIZONTAL,
-                                     command=self.mudar_fatia)
-        self.slice_slider.pack(fill=tk.X)
-        
-        self.lbl_slice = ttk.Label(self.nav_frame, text="Fatia: 0/0")
-        self.lbl_slice.pack(anchor=tk.W)
         
         # Controles de zoom
         self.zoom_frame = ttk.LabelFrame(self.painel_esquerdo, text="Zoom", padding=10)
@@ -649,15 +615,6 @@ class AlzheimerAnalysisGUI:
             self.lbl_formato.config(text=f"Formato: {self.current_metadata['format']}")
             self.lbl_dimensoes.config(text=f"Dimensões: {self.current_metadata['shape']}")
             
-            if len(self.current_metadata['shape']) == 3:
-                max_slice = self.current_metadata['shape'][self.current_axis] - 1
-                self.slice_slider.config(to=max_slice)
-                self.current_slice_index = max_slice // 2
-                self.slice_slider.set(self.current_slice_index)
-            else:
-                self.slice_slider.config(to=0)
-                self.current_slice_index = 0
-            
             self.zoom_level = 1.0
             self.exibir_imagem()
             
@@ -671,14 +628,7 @@ class AlzheimerAnalysisGUI:
         
         self.ax.clear()
         
-        if len(self.current_image_data.shape) == 3:
-            slice_data = ImageLoader.get_slice(self.current_image_data, 
-                                              self.current_axis, 
-                                              self.current_slice_index)
-            max_slice = self.current_image_data.shape[self.current_axis] - 1
-            self.lbl_slice.config(text=f"Fatia: {self.current_slice_index}/{max_slice}")
-        else:
-            slice_data = self.current_image_data
+        slice_data = self.current_image_data
         
         display_data = ImageLoader.normalize_for_display(slice_data)
         
@@ -699,12 +649,8 @@ class AlzheimerAnalysisGUI:
         self.canvas.draw()
     
     # =========================================================================
-    # CONTROLES DE NAVEGAÇÃO E ZOOM
+    # CONTROLES DE ZOOM
     # =========================================================================
-    def mudar_fatia(self, value):
-        self.current_slice_index = int(float(value))
-        self.exibir_imagem()
-    
     def zoom_in(self):
         self.zoom_level *= 1.2
         self.lbl_zoom.config(text=f"Zoom: {int(self.zoom_level*100)}%")
@@ -730,9 +676,9 @@ class AlzheimerAnalysisGUI:
         try:
             messagebox.showinfo("Preparando Dados", "Carregando e preparando dados...\nIsso pode levar alguns minutos.")
             self.train_data, self.val_data, self.test_data, self.valid_data_df, self.split_info = load_and_prepare_data()
-            messagebox.showinfo("Sucesso", f"Dados preparados!\n\n"
-                              f"Exames Treino: {self.split_info['num_train_exams']}\n"
-                              f"Exames Validação: {self.split_info['num_val_exams']}\n"
+            messagebox.showinfo("Sucesso", f"Dados preparados!\n\n" 
+                              f"Exames Treino: {self.split_info['num_train_exams']}\n" 
+                              f"Exames Validação: {self.split_info['num_val_exams']}\n" 
                               f"Exames Teste: {self.split_info['num_test_exams']}")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao preparar dados:\n{str(e)}")
@@ -799,10 +745,10 @@ class AlzheimerAnalysisGUI:
             self.x_test_features_reg = np.concatenate([morph_test, tex_test, clin_test], axis=1)
             
             messagebox.showinfo("Sucesso", 
-                f"Características de REGRESSÃO extraídas!\n"
-                f"Dimensão: {self.x_train_features_reg.shape[1]} features\n"
-                f"  - Morfológicas (planilha.csv): 7\n"
-                f"  - Textura (GLCM): {tex_train.shape[1]}\n"
+                f"Características de REGRESSÃO extraídas!\n" 
+                f"Dimensão: {self.x_train_features_reg.shape[1]} features\n" 
+                f"  - Morfológicas (planilha.csv): 7\n" 
+                f"  - Textura (GLCM): {tex_train.shape[1]}\n" 
                 f"  - Clínicas (OASIS): {clin_train.shape[1]}")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao extrair características de regressão:\n{str(e)}")
@@ -839,8 +785,8 @@ class AlzheimerAnalysisGUI:
             acc, sens, spec, cm = evaluate_classifier(self.test_data[1], y_pred, "SVM")
             
             messagebox.showinfo("Resultados SVM", 
-                              f"Acurácia: {acc:.4f}\n"
-                              f"Sensibilidade: {sens:.4f}\n"
+                              f"Acurácia: {acc:.4f}\n" 
+                              f"Sensibilidade: {sens:.4f}\n" 
                               f"Especificidade: {spec:.4f}")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao avaliar SVM:\n{str(e)}")
@@ -1276,9 +1222,9 @@ class AlzheimerAnalysisGUI:
             solidity, extent, mean_intensity.
         """
 
-        # -------------------------------
+        # ------------------------------- 
         # 1. Pick image and normalize
-        # -------------------------------
+        # ------------------------------- 
         if x_train_img.ndim == 3:
             img = x_train_img[idx].astype(np.float32)   # (H, W)
         else:
@@ -1297,9 +1243,9 @@ class AlzheimerAnalysisGUI:
             ax.axis("off")
             self.show_plot_main(fig)
 
-        # -------------------------------
+        # ------------------------------- 
         # 2. Gaussian denoising
-        # -------------------------------
+        # ------------------------------- 
         img_denoised = cv2.GaussianBlur(img_norm, (5, 5), sigmaX=1)
 
         if debug_plots:
@@ -1310,10 +1256,10 @@ class AlzheimerAnalysisGUI:
             ax.axis("off")
             self.show_plot_main(fig)
 
-        # -------------------------------
+        # ------------------------------- 
         # 3. K-means on intensities
         #    (dark vs bright)
-        # -------------------------------
+        # ------------------------------- 
         pixels = img_denoised.reshape((-1, 1)).astype(np.float32)
 
         criteria = (
@@ -1350,10 +1296,10 @@ class AlzheimerAnalysisGUI:
             ax.axis("off")
             self.show_plot_main(fig)
 
-        # -------------------------------
+        # ------------------------------- 
         # 4. Rough brain mask via Otsu
         #    (to avoid outside background)
-        # -------------------------------
+        # ------------------------------- 
         _, brain_bin = cv2.threshold(
             img_denoised, 0, 255,
             cv2.THRESH_BINARY + cv2.THRESH_OTSU
@@ -1371,9 +1317,9 @@ class AlzheimerAnalysisGUI:
             ax.axis("off")
             self.show_plot_main(fig)
 
-        # -------------------------------
+        # ------------------------------- 
         # 5. Restrict dark cluster to brain region
-        # -------------------------------
+        # ------------------------------- 
         candidate_mask = np.zeros_like(dark_mask)
         candidate_mask[y:y + h_b, x:x + w_b] = dark_mask[y:y + h_b, x:x + w_b]
 
@@ -1389,10 +1335,10 @@ class AlzheimerAnalysisGUI:
             ax.axis("off")
             self.show_plot_main(fig)
 
-        # -------------------------------
+        # ------------------------------- 
         # 6. Connected components:
         #    largest dark object inside brain = ventricle
-        # -------------------------------
+        # ------------------------------- 
         num_labels, cc_labels, stats, centroids = cv2.connectedComponentsWithStats(
             candidate_mask, connectivity=8
         )
@@ -1464,8 +1410,8 @@ class AlzheimerAnalysisGUI:
             ax = fig.add_subplot(111)
             ax.imshow(ventricle_mask, cmap='gray')
             ax.set_title(
-                f"Ventricle mask\n"
-                f"area={max_area:.1f}, P={perimeter:.1f}, circ={circularity:.3f}\n"
+                f"Ventricle mask\n" 
+                f"area={max_area:.1f}, P={perimeter:.1f}, circ={circularity:.3f}\n" 
                 f"ecc={eccentricity:.3f}, sol={solidity:.3f}, ext={extent:.3f}"
             )
             ax.axis("off")
@@ -1493,11 +1439,7 @@ class AlzheimerAnalysisGUI:
             messagebox.showwarning("Aviso", "Carregue uma imagem primeiro!")
             return
         try:
-            # Usa fatia atual
-            if len(self.current_image_data.shape) == 3:
-                slice_data = ImageLoader.get_slice(self.current_image_data, self.current_axis, self.current_slice_index)
-            else:
-                slice_data = self.current_image_data
+            slice_data = self.current_image_data
             
             # Chama função avançada de identificação de ventrículos
             ventricle_mask, label_img, centers, features = self.identify_ventricles(
@@ -1520,22 +1462,7 @@ class AlzheimerAnalysisGUI:
         except Exception as e:
             messagebox.showerror("Erro", f"Falha na segmentação:\n{str(e)}")
 
-    def exibir_todas_fatias(self):
-        """Exibe grid com todas as fatias (se 3D)."""
-        if self.current_image_data is None or len(self.current_image_data.shape) != 3:
-            messagebox.showwarning("Aviso", "Imagem 3D não carregada.")
-            return
-        data = self.current_image_data
-        num_slices = data.shape[2]
-        cols = 8
-        rows = int(np.ceil(num_slices/cols))
-        fig = Figure(figsize=(15, rows*2), dpi=100)
-        for i in range(num_slices):
-            ax = fig.add_subplot(rows, cols, i+1)
-            ax.imshow(ImageLoader.normalize_for_display(data[:,:,i]), cmap='gray')
-            ax.axis('off')
-        fig.tight_layout()
-        self.show_plot_main(fig)
+
     
     # =========================================================================
     # ACESSIBILIDADE
@@ -1548,7 +1475,7 @@ class AlzheimerAnalysisGUI:
         
         # Atualiza labels
         for widget in [self.lbl_arquivo, self.lbl_formato, self.lbl_dimensoes, 
-                      self.lbl_slice, self.lbl_zoom]:
+                      self.lbl_zoom]:
             widget.config(font=self.base_font)
     
     def aumentar_fonte(self):
