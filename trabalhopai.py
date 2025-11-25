@@ -1,12 +1,6 @@
-# trabalhopai.py - VERSÃO COMPLETA COM INTERFACE GRÁFICA
-# Sistema de Análise de Imagens - Alzheimer
-
-# =============================================================================
-# IMPORTS
-# =============================================================================
-import numpy as np 
+import numpy as np
 import os
-import pandas as pd 
+import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -30,11 +24,7 @@ from tensorflow.keras.applications import DenseNet121
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import Callback
 
-# =============================================================================
-# CALLBACK CUSTOMIZADO PARA TESTE
-# =============================================================================
 class TestAccuracyCallback(Callback):
-    """Callback para registrar acurácia de teste ao fim de cada época."""
     def __init__(self, x_test, y_test):
         super().__init__()
         self.x_test = x_test
@@ -48,23 +38,10 @@ class TestAccuracyCallback(Callback):
         self.test_acc.append(acc)
         print(f"Época {epoch+1} - Test Accuracy: {acc:.4f}")
 
-# =============================================================================
-# CLASSE IMAGE LOADER (integrado de image_loader.py)
-# =============================================================================
 class ImageLoader:
-    """Classe para carregar imagens médicas em diferentes formatos."""
     
     @staticmethod
     def load_image(file_path):
-        """
-        Carrega uma imagem de qualquer formato suportado. 
-        
-        Args:
-            file_path (str): Caminho para o arquivo de imagem
-            
-        Returns:
-            tuple: (image_data, metadata)
-        """
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Arquivo não encontrado: {file_path}")
         
@@ -81,7 +58,6 @@ class ImageLoader:
     
     @staticmethod
     def _load_nifti(file_path):
-        """Carrega imagem Nifti (3D ou 4D)."""
         img = nib.load(file_path)
         data = img.get_fdata()
         
@@ -99,7 +75,6 @@ class ImageLoader:
     
     @staticmethod
     def _load_2d_image(file_path):
-        """Carrega imagem 2D (PNG, JPG)."""
         img = Image.open(file_path)
         data = np.array(img)
         
@@ -116,7 +91,6 @@ class ImageLoader:
     
     @staticmethod
     def normalize_for_display(image_data):
-        """Normaliza dados da imagem para exibição (0-255)."""
         data = image_data.copy()
         data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
         
@@ -130,13 +104,9 @@ class ImageLoader:
         
         return data
 
-# =============================================================================
-# FUNÇÕES DE PROCESSAMENTO DE DADOS
-# =============================================================================
 image_size = (128, 128)
 
 def load_images(paths):
-    """Loads and resizes NIfTI images."""
     data = []
     for path in paths:
         if os.path.exists(path):
@@ -152,9 +122,6 @@ def load_images(paths):
     return np.array(data)
 
 def load_and_prepare_data():
-    """Preparação detalhada dos dados por paciente (split 80/20 + validação).
-    Retorna também estrutura 'split_info' com DataFrames e estatísticas.
-    """
     base_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(base_dir, 'oasis_longitudinal_demographic.csv')
     demographics_df = pd.read_csv(csv_path, sep=';')
@@ -206,12 +173,10 @@ def load_and_prepare_data():
     x_val_img = load_images(val_paths)
     x_test_img = load_images(test_paths)
 
-    # Carrega planilha.csv para features morfológicas (regressão)
     planilha_path = os.path.join(base_dir, 'planilha.csv')
     planilha_df = None
     if os.path.exists(planilha_path):
         planilha_df = pd.read_csv(planilha_path)
-        # Normaliza colunas numéricas que podem ter vírgula
         for col in ['nWBV', 'area', 'perimeter', 'circularity', 'eccentricity', 'solidity', 'extent', 'mean_intensity']:
             if col in planilha_df.columns:
                 planilha_df[col] = planilha_df[col].astype(str).str.replace(',', '.', regex=False)
@@ -237,7 +202,6 @@ def load_and_prepare_data():
            valid_data_df, split_info
 
 def extract_features(images):
-    """Extrai features de textura multi-distâncias/ângulos + estatísticas + quadrantes."""
     features = []
     distances = [1,3,5]
     angles = [0, np.pi/4, np.pi/2, 3*np.pi/4]
@@ -250,7 +214,6 @@ def extract_features(images):
                 vals = graycoprops(glcm, prop)[0,:]
                 vec.append(vals.mean())
                 vec.append(vals.std())
-        # estatísticas globais
         vec.extend([
             np.mean(img), np.std(img), np.median(img), np.min(img), np.max(img),
             np.percentile(img,25), np.percentile(img,75), np.var(img)
@@ -263,16 +226,13 @@ def extract_features(images):
     return np.array(features, dtype=np.float32)
 
 def extract_morphological_features(planilha_df, mri_ids):
-    """Extrai features morfológicas da planilha.csv (area, perimeter, circularity, eccentricity, solidity, extent, mean_intensity)."""
     if planilha_df is None:
-        # Retorna features vazias se planilha não disponível
         return np.zeros((len(mri_ids), 7), dtype=np.float32)
     
     morphological = []
     for mri in mri_ids:
         row = planilha_df[planilha_df['MRI ID'] == mri]
         if len(row) == 0:
-            # Valores padrão se não encontrar
             morphological.append([1000.0, 300.0, 0.15, 0.7, 0.6, 0.4, 45.0])
             continue
         r = row.iloc[0]
@@ -288,9 +248,7 @@ def extract_morphological_features(planilha_df, mri_ids):
     return np.array(morphological, dtype=np.float32)
 
 def extract_clinical_features(data_df, mri_ids):
-    """Extrai features clínicas (EDUC, MMSE, eTIV, nWBV, ASF, Visit, Years_since_first, CDR)."""
     clinical = []
-    # calcular primeira visita por paciente (MR Delay mínima)
     first_delay = {}
     for _, row in data_df.iterrows():
         sid = row['Subject ID']
@@ -326,7 +284,6 @@ def extract_clinical_features(data_df, mri_ids):
     return np.array(clinical, dtype=np.float32)
 
 def evaluate_classifier(y_true, y_pred, model_name):
-    """Calculates and prints classification metrics."""
     cm = confusion_matrix(y_true, y_pred)
     tn, fp, fn, tp = cm.ravel() if cm.shape == (2, 2) else (0, 0, 0, 0)
     
@@ -343,7 +300,6 @@ def evaluate_classifier(y_true, y_pred, model_name):
     return accuracy, sensitivity, specificity, cm
 
 def plot_learning_curves(history, model_name):
-    """Plots accuracy learning curves."""
     plt.figure(figsize=(8, 5))
     plt.plot(history.history['accuracy'], label='Training Accuracy')
     plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
@@ -353,59 +309,46 @@ def plot_learning_curves(history, model_name):
     plt.legend(loc='lower right')
     plt.show()
 
-# =============================================================================
-# INTERFACE GRÁFICA
-# =============================================================================
 class AlzheimerAnalysisGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Sistema de Análise de Imagens - Alzheimer")
         self.root.geometry("1200x800")
         
-        # Variáveis de controle
         self.current_image_data = None
         self.current_metadata = None
         self.zoom_level = 1.0
         
-        # Dataset paths
         self.dataset_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'axl')
         
-        # Modelos
         self.svm_model = None
         self.xgboost_model = None
         self.densenet_classif = None
         self.densenet_regress = None
         self.densenet_history = None
         
-        # Dados
         self.train_data = None
         self.val_data = None
         self.test_data = None
         self.valid_data_df = None
         self.test_patients = None
         
-        # Características extraídas
         self.x_train_features = None
         self.x_val_features = None
         self.x_test_features = None
         
-        # Acessibilidade - Tamanho de fonte
         self.font_size = 12
         self.base_font = ("Arial", self.font_size)
         
         self.setup_ui()
     
     def setup_ui(self):
-        """Configura a interface do usuário"""
-        # Estilo
         self.style = ttk.Style()
         self.style.configure("TButton", font=self.base_font, padding=5)
         self.style.configure("TLabel", font=self.base_font)
         
-        # Menu Superior
         menu_bar = tk.Menu(self.root)
         
-        # Menu Arquivo
         menu_arquivo = tk.Menu(menu_bar, tearoff=0)
         menu_arquivo.add_command(label="Carregar Imagem", command=self.carregar_dataset)
         menu_arquivo.add_command(label="Carregar Arquivo Externo", command=self.carregar_arquivo_externo)
@@ -413,7 +356,6 @@ class AlzheimerAnalysisGUI:
         menu_arquivo.add_command(label="Sair", command=self.root.quit)
         menu_bar.add_cascade(label="Arquivo", menu=menu_arquivo)
         
-        # Menu Dados
         menu_dados = tk.Menu(menu_bar, tearoff=0)
         menu_dados.add_command(label="Preparar Dados (80/20)", command=self.preparar_dados)
         menu_dados.add_separator()
@@ -421,21 +363,18 @@ class AlzheimerAnalysisGUI:
         menu_dados.add_command(label="Extrair Características (Regressão)", command=self.extrair_caracteristicas_regressao)
         menu_bar.add_cascade(label="Dados", menu=menu_dados)
         
-        # Menu SVM
         menu_svm = tk.Menu(menu_bar, tearoff=0)
         menu_svm.add_command(label="Treinar SVM", command=self.treinar_svm)
         menu_svm.add_command(label="Avaliar SVM", command=self.avaliar_svm)
         menu_svm.add_command(label="Matriz de Confusão", command=self.matriz_confusao_svm)
         menu_bar.add_cascade(label="SVM", menu=menu_svm)
         
-        # Menu XGBoost
         menu_xgb = tk.Menu(menu_bar, tearoff=0)
         menu_xgb.add_command(label="Treinar XGBoost", command=self.treinar_xgboost)
         menu_xgb.add_command(label="Avaliar XGBoost", command=self.avaliar_xgboost)
         menu_xgb.add_command(label="Análise Temporal", command=self.analise_temporal)
         menu_bar.add_cascade(label="XGBoost", menu=menu_xgb)
         
-        # Menu DenseNet
         menu_densenet = tk.Menu(menu_bar, tearoff=0)
         menu_densenet.add_command(label="Treinar Classificação", command=self.treinar_densenet_classif)
         menu_densenet.add_command(label="Treinar Regressão", command=self.treinar_densenet_regress)
@@ -445,34 +384,27 @@ class AlzheimerAnalysisGUI:
         menu_densenet.add_command(label="Curvas Classificação", command=self.plot_curvas_densenet_classif)
         menu_bar.add_cascade(label="DenseNet", menu=menu_densenet)
 
-        # Menu Visualização
         menu_vis = tk.Menu(menu_bar, tearoff=0)
         menu_vis.add_command(label="Gráficos de Dispersão (planilha)", command=self.plot_scatter_matrix)
         menu_bar.add_cascade(label="Visualização", menu=menu_vis)
         
-        # Menu Acessibilidade
         menu_acess = tk.Menu(menu_bar, tearoff=0)
         menu_acess.add_command(label="Aumentar Fonte", command=self.aumentar_fonte)
         menu_acess.add_command(label="Diminuir Fonte", command=self.diminuir_fonte)
         menu_bar.add_cascade(label="Acessibilidade", menu=menu_acess)
 
-        # Menu Segmentação
         menu_seg = tk.Menu(menu_bar, tearoff=0)
         menu_seg.add_command(label="Segmentar Ventrículos", command=self.segmentar_ventriculos)
         menu_bar.add_cascade(label="Segmentação", menu=menu_seg)
         
         self.root.config(menu=menu_bar)
         
-        # Layout Principal
-        # Painel Esquerdo
         self.painel_esquerdo = ttk.Frame(self.root, width=300)
         self.painel_esquerdo.pack(side=tk.LEFT, fill=tk.BOTH, padx=10, pady=10)
         
-        # Painel Direito
         self.painel_direito = ttk.Frame(self.root)
         self.painel_direito.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # === PAINEL ESQUERDO ===
         ttk.Label(self.painel_esquerdo, text="Informações da Imagem", 
                  font=("Arial", 14, "bold")).pack(pady=10)
         
@@ -488,7 +420,6 @@ class AlzheimerAnalysisGUI:
         self.lbl_dimensoes = ttk.Label(self.info_frame, text="Dimensões: -")
         self.lbl_dimensoes.pack(anchor=tk.W)
         
-        # Controles de zoom
         self.zoom_frame = ttk.LabelFrame(self.painel_esquerdo, text="Zoom", padding=10)
         self.zoom_frame.pack(fill=tk.X, pady=10)
         
@@ -502,7 +433,6 @@ class AlzheimerAnalysisGUI:
         self.lbl_zoom = ttk.Label(self.zoom_frame, text="Zoom: 100%")
         self.lbl_zoom.pack(pady=5)
         
-        # === PAINEL DIREITO COM TABS ===
         self.tabs = ttk.Notebook(self.painel_direito)
         self.tab_imagem = ttk.Frame(self.tabs)
         self.tab_graficos = ttk.Frame(self.tabs)
@@ -510,7 +440,6 @@ class AlzheimerAnalysisGUI:
         self.tabs.add(self.tab_graficos, text="Gráficos")
         self.tabs.pack(fill=tk.BOTH, expand=True)
 
-        # Figura principal (Imagem)
         self.fig = Figure(figsize=(8, 6), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_title("Visualizador de Imagens Médicas")
@@ -521,7 +450,6 @@ class AlzheimerAnalysisGUI:
         self.ax.text(0.5, 0.5, 'Carregue uma imagem\npelo menu Arquivo',
                  ha='center', va='center', fontsize=16, transform=self.ax.transAxes)
 
-        # Figura gráficos
         self.fig_plots = Figure(figsize=(8, 6), dpi=100)
         self.ax_plots = self.fig_plots.add_subplot(111)
         self.ax_plots.axis('off')
@@ -529,12 +457,8 @@ class AlzheimerAnalysisGUI:
         self.canvas_plots.draw()
         self.canvas_plots.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.ax_plots.text(0.5, 0.5, 'Gráficos aparecerão aqui', ha='center', va='center', fontsize=14, transform=self.ax_plots.transAxes)
-
-    # =========================================================================
-    # UTILITÁRIOS DE FIGURA
-    # =========================================================================
+    
     def show_figure(self, fig, title="Figura"):
-        """Exibe figura matplotlib em janela separada Tkinter."""
         win = tk.Toplevel(self.root)
         win.title(title)
         canvas = FigureCanvasTkAgg(fig, master=win)
@@ -544,14 +468,8 @@ class AlzheimerAnalysisGUI:
         btn.pack(pady=5)
 
     def show_plot_main(self, fig):
-        """Renderiza figura na aba 'Gráficos'."""
-        # Limpa figura anterior
         self.fig_plots.clf()
-        # Copia axes da figura recebida
-        # Estratégia: desenhar a figura recebida diretamente no canvas da aba usando Agg.
-        # Mais simples: substituir self.fig_plots por fig e recriar canvas.
         self.fig_plots = fig
-        # Recria canvas
         for child in self.tab_graficos.winfo_children():
             child.destroy()
         self.canvas_plots = FigureCanvasTkAgg(self.fig_plots, master=self.tab_graficos)
@@ -559,11 +477,7 @@ class AlzheimerAnalysisGUI:
         self.canvas_plots.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.tabs.select(self.tab_graficos)
     
-    # =========================================================================
-    # FUNÇÕES DE CARREGAMENTO DE IMAGEM
-    # =========================================================================
     def carregar_dataset(self):
-        """Carrega uma imagem do dataset"""
         if not os.path.exists(self.dataset_path):
             messagebox.showerror("Erro", f"Diretório não encontrado: {self.dataset_path}")
             return
@@ -596,7 +510,6 @@ class AlzheimerAnalysisGUI:
         ttk.Button(dialog, text="Carregar", command=selecionar).pack(pady=10)
     
     def carregar_arquivo_externo(self):
-        """Carrega arquivo externo (NIfTI, PNG, JPG)"""
         filetypes = [
             ("Todos os suportados", "*.nii *.nii.gz *.png *.jpg *.jpeg"),
             ("NIfTI", "*.nii *.nii.gz"),
@@ -607,7 +520,6 @@ class AlzheimerAnalysisGUI:
             self.carregar_e_exibir(filepath)
     
     def carregar_e_exibir(self, filepath):
-        """Carrega e exibe uma imagem"""
         try:
             self.current_image_data, self.current_metadata = ImageLoader.load_image(filepath)
             
@@ -622,7 +534,6 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Erro ao carregar imagem:\n{str(e)}")
     
     def exibir_imagem(self):
-        """Exibe a imagem atual no canvas"""
         if self.current_image_data is None:
             return
         
@@ -648,9 +559,6 @@ class AlzheimerAnalysisGUI:
         
         self.canvas.draw()
     
-    # =========================================================================
-    # CONTROLES DE ZOOM
-    # =========================================================================
     def zoom_in(self):
         self.zoom_level *= 1.2
         self.lbl_zoom.config(text=f"Zoom: {int(self.zoom_level*100)}%")
@@ -668,41 +576,30 @@ class AlzheimerAnalysisGUI:
         self.lbl_zoom.config(text=f"Zoom: {int(self.zoom_level*100)}%")
         self.exibir_imagem()
     
-    # =========================================================================
-    # FUNÇÕES DE PROCESSAMENTO
-    # =========================================================================
     def preparar_dados(self):
-        """Prepara dados com split 80/20"""
         try:
             messagebox.showinfo("Preparando Dados", "Carregando e preparando dados...\nIsso pode levar alguns minutos.")
             self.train_data, self.val_data, self.test_data, self.valid_data_df, self.split_info = load_and_prepare_data()
-            messagebox.showinfo("Sucesso", f"Dados preparados!\n\n" 
-                              f"Exames Treino: {self.split_info['num_train_exams']}\n" 
-                              f"Exames Validação: {self.split_info['num_val_exams']}\n" 
-                              f"Exames Teste: {self.split_info['num_test_exams']}")
+            messagebox.showinfo("Sucesso", f"Dados preparados!\n\nExames Treino: {self.split_info['num_train_exams']}\nExames Validação: {self.split_info['num_val_exams']}\nExames Teste: {self.split_info['num_test_exams']}")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao preparar dados:\n{str(e)}")
     
     def extrair_caracteristicas(self):
-        """Extrai características GLCM + clínicas para CLASSIFICAÇÃO (SVM e DenseNet classif)"""
         if self.train_data is None:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
         
         try:
             messagebox.showinfo("Extraindo", "Extraindo características para CLASSIFICAÇÃO...\nIsso pode levar alguns minutos.")
-            # Textura
             tex_train = extract_features(self.train_data[0])
             tex_val = extract_features(self.val_data[0])
             tex_test = extract_features(self.test_data[0])
-            # Clínicas (usa DataFrames do split_info)
             train_mri_ids = self.split_info['train_df']['MRI ID'].tolist()
             val_mri_ids = self.split_info['val_df']['MRI ID'].tolist()
             test_mri_ids = self.split_info['test_df']['MRI ID'].tolist()
             clin_train = extract_clinical_features(self.valid_data_df, train_mri_ids)
             clin_val = extract_clinical_features(self.valid_data_df, val_mri_ids)
             clin_test = extract_clinical_features(self.valid_data_df, test_mri_ids)
-            # Concatena (textura + clínica) - SEM morfológicas para classificação
             self.x_train_features = np.concatenate([tex_train, clin_train], axis=1)
             self.x_val_features = np.concatenate([tex_val, clin_val], axis=1)
             self.x_test_features = np.concatenate([tex_test, clin_test], axis=1)
@@ -711,35 +608,29 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Erro ao extrair características:\n{str(e)}")
     
     def extrair_caracteristicas_regressao(self):
-        """Extrai características morfológicas (planilha.csv) + textura + clínicas para REGRESSÃO (XGBoost)"""
         if self.train_data is None:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
         
         try:
             messagebox.showinfo("Extraindo", "Extraindo características para REGRESSÃO...\nIsso pode levar alguns minutos.")
-            # Textura
             tex_train = extract_features(self.train_data[0])
             tex_val = extract_features(self.val_data[0])
             tex_test = extract_features(self.test_data[0])
             
-            # MRI IDs
             train_mri_ids = self.split_info['train_df']['MRI ID'].tolist()
             val_mri_ids = self.split_info['val_df']['MRI ID'].tolist()
             test_mri_ids = self.split_info['test_df']['MRI ID'].tolist()
             
-            # Morfológicas da planilha.csv
             planilha_df = self.split_info.get('planilha_df')
             morph_train = extract_morphological_features(planilha_df, train_mri_ids)
             morph_val = extract_morphological_features(planilha_df, val_mri_ids)
             morph_test = extract_morphological_features(planilha_df, test_mri_ids)
             
-            # Clínicas
             clin_train = extract_clinical_features(self.valid_data_df, train_mri_ids)
             clin_val = extract_clinical_features(self.valid_data_df, val_mri_ids)
             clin_test = extract_clinical_features(self.valid_data_df, test_mri_ids)
             
-            # Concatena (morfológicas + textura + clínicas) para regressão
             self.x_train_features_reg = np.concatenate([morph_train, tex_train, clin_train], axis=1)
             self.x_val_features_reg = np.concatenate([morph_val, tex_val, clin_val], axis=1)
             self.x_test_features_reg = np.concatenate([morph_test, tex_test, clin_test], axis=1)
@@ -753,11 +644,7 @@ class AlzheimerAnalysisGUI:
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao extrair características de regressão:\n{str(e)}")
     
-    # =========================================================================
-    # SVM - CLASSIFICADOR RASO
-    # =========================================================================
     def treinar_svm(self):
-        """Treina SVM"""
         if self.x_train_features is None:
             messagebox.showwarning("Aviso", "Extraia as características primeiro!")
             return
@@ -774,7 +661,6 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Erro ao treinar SVM:\n{str(e)}")
     
     def avaliar_svm(self):
-        """Avalia SVM no conjunto de teste"""
         if self.svm_model is None:
             messagebox.showwarning("Aviso", "Treine o SVM primeiro!")
             return
@@ -784,15 +670,11 @@ class AlzheimerAnalysisGUI:
             y_pred = self.svm_model.predict(X_test_scaled)
             acc, sens, spec, cm = evaluate_classifier(self.test_data[1], y_pred, "SVM")
             
-            messagebox.showinfo("Resultados SVM", 
-                              f"Acurácia: {acc:.4f}\n" 
-                              f"Sensibilidade: {sens:.4f}\n" 
-                              f"Especificidade: {spec:.4f}")
+            messagebox.showinfo("Resultados SVM", f"Acurácia: {acc:.4f}\nSensibilidade: {sens:.4f}\nEspecificidade: {spec:.4f}")
         except Exception as e:
             messagebox.showerror("Erro", f"Erro ao avaliar SVM:\n{str(e)}")
     
     def matriz_confusao_svm(self):
-        """Mostra matriz de confusão do SVM"""
         if self.svm_model is None:
             messagebox.showwarning("Aviso", "Treine o SVM primeiro!")
             return
@@ -812,11 +694,7 @@ class AlzheimerAnalysisGUI:
         except Exception as e:
             messagebox.showerror("Erro", f"Erro:\n{str(e)}")
     
-    # =========================================================================
-    # XGBOOST - REGRESSOR RASO
-    # =========================================================================
     def treinar_xgboost(self):
-        """Treina XGBoost para regressão de idade usando features da planilha.csv"""
         if not hasattr(self, 'x_train_features_reg') or self.x_train_features_reg is None:
             messagebox.showwarning("Aviso", "Extraia as características de REGRESSÃO primeiro!\n(Use 'Extrair Características (Regressão)')")
             return
@@ -832,11 +710,10 @@ class AlzheimerAnalysisGUI:
                 reg_alpha=0.1,
                 reg_lambda=1.0,
                 random_state=42,
-                eval_metric='mae'  # compatível com versões antigas (no params)
+                eval_metric='mae'
             )
             self.xgboost_model = xgb.XGBRegressor(**params)
             try:
-                # Tentativa com early stopping e eval_set (APIs mais novas)
                 self.xgboost_model.fit(
                     self.x_train_features_reg,
                     self.train_data[2],
@@ -845,9 +722,7 @@ class AlzheimerAnalysisGUI:
                     verbose=False
                 )
             except TypeError:
-                # Fallback para APIs antigas sem esses kwargs
                 self.xgboost_model.fit(self.x_train_features_reg, self.train_data[2])
-            # Recupera melhor iteração de forma robusta (difere por versão do XGBoost)
             best_iter = getattr(self.xgboost_model, 'best_iteration', None)
             if best_iter is None:
                 try:
@@ -863,7 +738,6 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Erro ao treinar XGBoost:\n{str(e)}")
     
     def avaliar_xgboost(self):
-        """Avaliação avançada XGBoost: MAE, RMSE, R2, dispersão, histograma de erros."""
         if self.xgboost_model is None:
             messagebox.showwarning("Aviso", "Treine o XGBoost primeiro!")
             return
@@ -872,13 +746,11 @@ class AlzheimerAnalysisGUI:
             y_true = self.test_data[2]
             y_pred = self.xgboost_model.predict(self.x_test_features_reg)
             mae = mean_absolute_error(y_true, y_pred)
-            # Compatível com versões antigas do scikit-learn (sem parâmetro 'squared')
             rmse = np.sqrt(mean_squared_error(y_true, y_pred))
             r2 = r2_score(y_true, y_pred)
             abs_err = np.abs(y_true - y_pred)
             pct_within_5 = np.mean(abs_err <= 5) * 100
             pct_within_10 = np.mean(abs_err <= 10) * 100
-            # Figura combinada
             fig = Figure(figsize=(10,4), dpi=100)
             ax1 = fig.add_subplot(121)
             ax2 = fig.add_subplot(122)
@@ -897,14 +769,12 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Erro:\n{str(e)}")
     
     def analise_temporal(self):
-        """Análise temporal avançada: verifica crescimento monotônico das idades preditas por paciente."""
         if self.xgboost_model is None:
             messagebox.showwarning("Aviso", "Treine o XGBoost primeiro!")
             return
         
         try:
             y_pred = self.xgboost_model.predict(self.x_test_features_reg)
-            # DataFrame de teste completo
             test_df = self.split_info['test_df'].copy()
             test_df = test_df.sort_values(['Subject ID','Visit'])
             test_df['PredictedAge'] = y_pred[:len(test_df)]
@@ -913,10 +783,9 @@ class AlzheimerAnalysisGUI:
             for sid, grp in test_df.groupby('Subject ID'):
                 if len(grp) > 1:
                     multi_patients += 1
-                    if np.all(np.diff(grp['PredictedAge'].values) >= -0.5):  # tolera pequena oscilação negativa
+                    if np.all(np.diff(grp['PredictedAge'].values) >= -0.5):
                         consistent += 1
             perc = (consistent / multi_patients * 100) if multi_patients>0 else 0
-            # Plot linhas por paciente (limitando a até 12 pacientes para legibilidade)
             fig = Figure(figsize=(8,5), dpi=100)
             ax = fig.add_subplot(111)
             for i,(sid, grp) in enumerate(test_df.groupby('Subject ID')):
@@ -932,11 +801,7 @@ class AlzheimerAnalysisGUI:
         except Exception as e:
             messagebox.showerror("Erro", f"Erro:\n{str(e)}")
     
-    # =========================================================================
-    # DENSENET - MODELO PROFUNDO
-    # =========================================================================
     def _prepare_images_densenet(self, images):
-        """Converte lista de imagens (N,H,W) para (N,224,224,3) normalizadas."""
         target = (224,224)
         out = []
         for img in images:
@@ -952,7 +817,6 @@ class AlzheimerAnalysisGUI:
         return np.array(out, dtype=np.float32)
 
     def treinar_densenet_classif(self):
-        """Treina DenseNet121 (ImageNet) para classificação binária com fine-tuning."""
         if self.train_data is None:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
@@ -967,7 +831,7 @@ class AlzheimerAnalysisGUI:
 
             base = DenseNet121(weights='imagenet', include_top=False, input_shape=(224,224,3))
             for layer in base.layers:
-                layer.trainable = False  # fase 1 congelada
+                layer.trainable = False
 
             x = base.output
             x = GlobalAveragePooling2D()(x)
@@ -986,7 +850,6 @@ class AlzheimerAnalysisGUI:
                 callbacks=[cb_test]
             )
 
-            # Fine-tuning: descongela últimas N camadas
             ft_layers = 50
             for layer in base.layers[-ft_layers:]:
                 layer.trainable = True
@@ -999,21 +862,17 @@ class AlzheimerAnalysisGUI:
                 callbacks=[cb_test]
             )
 
-            # Mescla históricos
             merged_history = {}
             for k in history_phase1.history.keys():
                 merged_history[k] = history_phase1.history[k] + history_phase2.history.get(k, [])
-            # Adiciona test_accuracy do callback
             merged_history['test_accuracy'] = cb_test.test_acc
 
-            # Armazena
             self.densenet_classif = model
             class SimpleHistory:
                 def __init__(self, hist):
                     self.history = hist
             self.densenet_history = SimpleHistory(merged_history)
 
-            # Plot curva com teste
             fig = Figure(figsize=(10,5), dpi=100)
             ax1 = fig.add_subplot(121)
             ax2 = fig.add_subplot(122)
@@ -1036,7 +895,6 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Falha no treinamento DenseNet:\n{str(e)}")
     
     def treinar_densenet_regress(self):
-        """Treina DenseNet121 para regressão de idade."""
         if self.train_data is None:
             messagebox.showwarning("Aviso", "Prepare os dados primeiro!")
             return
@@ -1059,7 +917,6 @@ class AlzheimerAnalysisGUI:
             history = model.fit(self.x_train_densenet_reg, y_train_age, validation_data=(self.x_val_densenet_reg, y_val_age), epochs=5, batch_size=8, verbose=1)
             self.densenet_regress = model
             self.densenet_regress_history = history
-            # Curvas
             fig = Figure(figsize=(8,5), dpi=100)
             ax1 = fig.add_subplot(121)
             ax2 = fig.add_subplot(122)
@@ -1078,7 +935,6 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Falha no treinamento DenseNet Regressão:\n{str(e)}")
     
     def plot_curvas_densenet_classif(self):
-        """Plota curvas (acurácia e loss) da DenseNet classificação com teste."""
         if self.densenet_history is None:
             messagebox.showwarning("Aviso", "Treine a DenseNet primeiro!")
             return
@@ -1104,7 +960,6 @@ class AlzheimerAnalysisGUI:
         self.show_figure(fig, title="Curvas DenseNet Classificação")
 
     def avaliar_densenet_classif(self):
-        """Avalia DenseNet classificação: métricas e matriz de confusão."""
         if self.densenet_classif is None or self.test_data is None:
             messagebox.showwarning("Aviso", "Treine DenseNet e prepare dados!")
             return
@@ -1126,7 +981,6 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Falha na avaliação DenseNet:\n{str(e)}")
     
     def avaliar_densenet_regress(self):
-        """Avalia DenseNet regressão no teste."""
         if self.densenet_regress is None or self.test_data is None:
             messagebox.showwarning("Aviso", "Treine a DenseNet regressão e prepare dados!")
             return
@@ -1137,7 +991,6 @@ class AlzheimerAnalysisGUI:
             mae = mean_absolute_error(y_test_age, preds)
             rmse = np.sqrt(mean_squared_error(y_test_age, preds))
             r2 = r2_score(y_test_age, preds)
-            # Dispersão
             fig = Figure(figsize=(6,5), dpi=100)
             ax = fig.add_subplot(111)
             ax.scatter(y_test_age, preds, alpha=0.7)
@@ -1150,10 +1003,6 @@ class AlzheimerAnalysisGUI:
             messagebox.showerror("Erro", f"Falha na avaliação DenseNet Regressão:\n{str(e)}")
 
     def plot_scatter_matrix(self):
-        """
-        Gera gráficos de dispersão (scatterplots) a partir de 'planilha.csv'.
-        Plota as características de segmentação aos pares, colorindo pela classe.
-        """
         try:
             messagebox.showinfo("Carregando", "Carregando dados da planilha e gerando gráficos...\nIsso pode levar um momento.")
             
@@ -1168,7 +1017,6 @@ class AlzheimerAnalysisGUI:
 
             feature_cols = ['area', 'perimeter', 'circularity', 'eccentricity', 'solidity', 'extent', 'mean_intensity']
             
-            # Garante que as colunas de features são numéricas, tratando vírgulas
             for col in feature_cols:
                 if df[col].dtype == 'object':
                     df[col] = df[col].str.replace(',', '.', regex=False)
@@ -1180,59 +1028,31 @@ class AlzheimerAnalysisGUI:
                 messagebox.showwarning("Aviso", "Não há dados válidos na planilha para gerar os gráficos.")
                 return
 
-            # Define a paleta de cores solicitada
             color_palette = {
                 'Nondemented': 'blue',
                 'Demented': 'red',
                 'Converted': 'black'
             }
             
-            # Gera o pairplot com Seaborn, sem gráficos na diagonal
             g = sns.pairplot(df, vars=feature_cols, hue='Group', palette=color_palette, plot_kws={'alpha': 0.6}, diag_kind=None)
             
-            g.fig.suptitle("Gráficos de Dispersão por Classe", y=1.02) # Título acima do gráfico
+            g.fig.suptitle("Gráficos de Dispersão por Classe", y=1.02)
             
-            # Usa o helper para exibir o gráfico na aba 'Gráficos'
             self.show_plot_main(g.fig)
 
             messagebox.showinfo("Sucesso", "Gráficos de dispersão gerados na aba 'Gráficos'.")
 
         except Exception as e:
             messagebox.showerror("Erro", f"Ocorreu um erro ao gerar os gráficos:\n{str(e)}")
-
-    # =========================================================================
-    # FUNÇÃO DE IDENTIFICAÇÃO DE VENTRÍCULOS (Completa)
-    # =========================================================================
+    
     def identify_ventricles(self, x_train_img, idx=0, debug_plots=True):
-        """
-        Identifies the ventricles on a brain slice as:
-        'the largest dark object inside the brain'.
-
-        Returns
-        -------
-        ventricle_mask : np.ndarray
-            Binary mask of ventricle contour (0/1).
-        label_img : np.ndarray
-            k-means label image (clusters 0..k-1).
-        centers : np.ndarray
-            k-means cluster centers (intensity).
-        features : dict
-            Shape descriptors:
-            area, perimeter, circularity, eccentricity,
-            solidity, extent, mean_intensity.
-        """
-
-        # ------------------------------- 
-        # 1. Pick image and normalize
-        # ------------------------------- 
         if x_train_img.ndim == 3:
-            img = x_train_img[idx].astype(np.float32)   # (H, W)
+            img = x_train_img[idx].astype(np.float32)
         else:
             img = x_train_img.astype(np.float32)
 
         h, w = img.shape
 
-        # Normalize to 0–255 for OpenCV ops
         img_norm = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
         if debug_plots:
@@ -1243,9 +1063,6 @@ class AlzheimerAnalysisGUI:
             ax.axis("off")
             self.show_plot_main(fig)
 
-        # ------------------------------- 
-        # 2. Gaussian denoising
-        # ------------------------------- 
         img_denoised = cv2.GaussianBlur(img_norm, (5, 5), sigmaX=1)
 
         if debug_plots:
@@ -1256,10 +1073,6 @@ class AlzheimerAnalysisGUI:
             ax.axis("off")
             self.show_plot_main(fig)
 
-        # ------------------------------- 
-        # 3. K-means on intensities
-        #    (dark vs bright)
-        # ------------------------------- 
         pixels = img_denoised.reshape((-1, 1)).astype(np.float32)
 
         criteria = (
@@ -1268,7 +1081,7 @@ class AlzheimerAnalysisGUI:
             0.85
         )
 
-        k = 2  # dark cluster vs bright cluster
+        k = 2
         compactness, labels, centers = cv2.kmeans(
             pixels,
             k,
@@ -1278,14 +1091,11 @@ class AlzheimerAnalysisGUI:
             cv2.KMEANS_RANDOM_CENTERS
         )
 
-        centers = centers.flatten()  # shape (k,)
-        # darkest cluster index (ventricles + dark stuff)
+        centers = centers.flatten()
         dark_cluster_id = np.argmin(centers)
 
-        # Label image: each pixel has cluster id 0..k-1
         label_img = labels.reshape((h, w))
 
-        # Binary mask for dark cluster
         dark_mask = (label_img == dark_cluster_id).astype(np.uint8)
 
         if debug_plots:
@@ -1296,17 +1106,12 @@ class AlzheimerAnalysisGUI:
             ax.axis("off")
             self.show_plot_main(fig)
 
-        # ------------------------------- 
-        # 4. Rough brain mask via Otsu
-        #    (to avoid outside background)
-        # ------------------------------- 
         _, brain_bin = cv2.threshold(
             img_denoised, 0, 255,
             cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
         brain_mask = (brain_bin > 0).astype(np.uint8)
 
-        # bounding box of brain to constrain candidates
         x, y, w_b, h_b = cv2.boundingRect(brain_bin)
 
         if debug_plots:
@@ -1317,13 +1122,9 @@ class AlzheimerAnalysisGUI:
             ax.axis("off")
             self.show_plot_main(fig)
 
-        # ------------------------------- 
-        # 5. Restrict dark cluster to brain region
-        # ------------------------------- 
         candidate_mask = np.zeros_like(dark_mask)
         candidate_mask[y:y + h_b, x:x + w_b] = dark_mask[y:y + h_b, x:x + w_b]
 
-        # Small morphological cleanup (optional)
         kernel = np.ones((3, 3), np.uint8)
         candidate_mask = cv2.morphologyEx(candidate_mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
@@ -1335,17 +1136,13 @@ class AlzheimerAnalysisGUI:
             ax.axis("off")
             self.show_plot_main(fig)
 
-        # ------------------------------- 
-        # 6. Connected components:
-        #    largest dark object inside brain = ventricle
-        # ------------------------------- 
+ 
         num_labels, cc_labels, stats, centroids = cv2.connectedComponentsWithStats(
             candidate_mask, connectivity=8
         )
 
         ventricle_mask = np.zeros_like(candidate_mask, dtype=np.uint8)
 
-        # inicializa descritores
         max_area = 0.0
         perimeter = 0.0
         circularity = np.nan
@@ -1356,31 +1153,25 @@ class AlzheimerAnalysisGUI:
 
         ventricle_label = -1
 
-        # label 0 is background
         for lab in range(1, num_labels):
             area = stats[lab, cv2.CC_STAT_AREA]
             cx, cy = centroids[lab]
 
-            # Check if centroid is inside brain bounding box
             if (x <= cx <= x + w_b) and (y <= cy <= y + h_b):
                 if area > max_area:
                     max_area = float(area)
                     ventricle_label = lab
 
         if ventricle_label > 0:
-            # Cria máscara cheia para o ventrículo
             ventricle_mask_full = (cc_labels == ventricle_label).astype(np.uint8)
 
-            # Contorno via dilatação - original
             kernel = np.ones((3, 3), np.uint8)
             dilated = cv2.dilate(ventricle_mask_full, kernel, iterations=1)
             ventricle_contour = (dilated - ventricle_mask_full)
             perimeter = float(np.sum(ventricle_contour))
 
-            # Circularidade: 4πA / P²
             circularity = (4.0 * np.pi * max_area) / (perimeter ** 2 + 1e-8)
 
-            # regionprops para descritores de forma
             labeled = label(ventricle_mask_full)
             regions = regionprops(labeled, intensity_image=img_norm)
 
@@ -1391,10 +1182,8 @@ class AlzheimerAnalysisGUI:
                 extent        = float(r.extent)
                 mean_intensity = float(r.mean_intensity)
 
-            # Salva contorno final na máscara original
             ventricle_mask[ventricle_contour == 1] = 1
 
-        # monta dicionário de descritores
         features = {
             "area": max_area,
             "perimeter": perimeter,
@@ -1418,7 +1207,7 @@ class AlzheimerAnalysisGUI:
             self.show_plot_main(fig)
 
             overlay = cv2.cvtColor(img_norm, cv2.COLOR_GRAY2BGR)
-            overlay[ventricle_mask == 1] = [255, 0, 0]  # red ventricle
+            overlay[ventricle_mask == 1] = [255, 0, 0]
 
             fig2 = Figure(figsize=(5, 5), dpi=100)
             ax2 = fig2.add_subplot(111)
@@ -1427,26 +1216,19 @@ class AlzheimerAnalysisGUI:
             ax2.axis("off")
             self.show_plot_main(fig2)
 
-        # máscara, labels do k-means, centers e descritores
         return ventricle_mask, label_img, centers, features
 
-    # =========================================================================
-    # SEGMENTAÇÃO VENTRÍCULOS (Interface - usa identify_ventricles)
-    # =========================================================================
     def segmentar_ventriculos(self):
-        """Segmenta ventrículos na fatia atual usando método avançado identify_ventricles."""
         if self.current_image_data is None:
             messagebox.showwarning("Aviso", "Carregue uma imagem primeiro!")
             return
         try:
             slice_data = self.current_image_data
             
-            # Chama função avançada de identificação de ventrículos
             ventricle_mask, label_img, centers, features = self.identify_ventricles(
                 slice_data, idx=0, debug_plots=True
             )
             
-            # Exibe features extraídas
             info_text = (
                 f"Características dos Ventrículos:\n\n"
                 f"Área: {features['area']:.1f} pixels\n"
@@ -1462,38 +1244,26 @@ class AlzheimerAnalysisGUI:
         except Exception as e:
             messagebox.showerror("Erro", f"Falha na segmentação:\n{str(e)}")
 
-
-    
-    # =========================================================================
-    # ACESSIBILIDADE
-    # =========================================================================
     def atualizar_fontes(self):
-        """Atualiza o tamanho de todas as fontes"""
         self.base_font = ("Arial", self.font_size)
         self.style.configure("TButton", font=self.base_font)
         self.style.configure("TLabel", font=self.base_font)
         
-        # Atualiza labels
         for widget in [self.lbl_arquivo, self.lbl_formato, self.lbl_dimensoes, 
                       self.lbl_zoom]:
             widget.config(font=self.base_font)
     
     def aumentar_fonte(self):
-        """Aumenta o tamanho da fonte"""
         self.font_size += 2
         self.atualizar_fontes()
         messagebox.showinfo("Acessibilidade", f"Fonte aumentada para {self.font_size}pt")
     
     def diminuir_fonte(self):
-        """Diminui o tamanho da fonte"""
         if self.font_size > 8:
             self.font_size -= 2
             self.atualizar_fontes()
             messagebox.showinfo("Acessibilidade", f"Fonte reduzida para {self.font_size}pt")
 
-# =============================================================================
-# MAIN
-# =============================================================================
 if __name__ == "__main__":
     root = tk.Tk()
     app = AlzheimerAnalysisGUI(root)
